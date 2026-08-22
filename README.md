@@ -8,6 +8,8 @@ This public record supports a computational reproducibility audit of neoantigen-
 
 > **Research boundary:** This is a computational methods and reproducibility audit. It does not establish peptide presentation, immunogenicity, vaccine-target suitability, efficacy, safety, treatment benefit, or clinical utility. No biological candidate is nominated. The HG008 holdout was not accessed.
 
+For a fact-checked Korean/English summary, verified findings, citation links, and media contact, see the [public media kit](MEDIA_KIT.md).
+
 ## Verified release
 
 The full reproducibility archive is available from [GitHub release v1.0.0](https://github.com/ByungwoongYoo/target-stability/releases/tag/v1.0.0) and the permanent [Zenodo record (DOI 10.5281/zenodo.22059254)](https://doi.org/10.5281/zenodo.22059254), together with its SHA-256 sidecar.
