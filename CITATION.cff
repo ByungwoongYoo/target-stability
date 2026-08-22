@@ -9,6 +9,8 @@ authors:
     orcid: "https://orcid.org/0009-0002-1797-3100"
 version: 1.0.0
 date-released: 2026-08-23
+doi: "10.5281/zenodo.22059254"
+url: "https://doi.org/10.5281/zenodo.22059254"
 license: MIT
 repository-code: "https://github.com/ByungwoongYoo/target-stability"
 abstract: >-
