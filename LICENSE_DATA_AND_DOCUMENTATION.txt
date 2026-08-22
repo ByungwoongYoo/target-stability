@@ -1,0 +1,17 @@
+Creative Commons Attribution 4.0 International (CC BY 4.0)
+
+Copyright (c) 2026 Byungwoong Yoo
+
+The author-generated documentation, figures, configuration files, and derived
+TSV/JSON result artifacts in this bundle are licensed under the Creative
+Commons Attribution 4.0 International License:
+
+https://creativecommons.org/licenses/by/4.0/
+
+Attribution should identify Byungwoong Yoo, the manuscript title, and the
+version or checksum of the reused artifact when practical.
+
+This license does not apply to third-party datasets, model archives, software,
+or source payloads. Those materials are not redistributed in this compact
+bundle and remain governed by their respective providers' terms. See
+THIRD_PARTY_SOURCES.md.
