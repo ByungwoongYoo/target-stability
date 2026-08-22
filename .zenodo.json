@@ -1,0 +1,12 @@
+{
+  "title": "Variant-level concordance can overstate exact peptide–HLA shortlist reproducibility: a 63-condition HCC1395 audit",
+  "upload_type": "software",
+  "description": "Reproducibility software and frozen analytical artifacts for a 63-condition HCC1395/HCC1395BL SEQC2 audit of computational neoantigen shortlist stability. The release evaluates analytical concordance at variant, peptide, and exact variant–peptide–HLA resolution. It nominates no biological candidate and does not establish presentation, immunogenicity, vaccine-target suitability, efficacy, safety, treatment benefit, or clinical utility. The HG008 holdout was not accessed.",
+  "creators": [{"name": "Yoo, Byungwoong", "affiliation": "Independent Researcher, Seoul, Republic of Korea", "orcid": "0009-0002-1797-3100"}],
+  "keywords": ["analytical reproducibility", "neoantigen prioritization", "peptide-HLA", "HLA provenance", "HCC1395", "SEQC2", "shortlist stability", "bioinformatics", "computational audit", "research software"],
+  "license": "MIT",
+  "version": "1.0.0",
+  "access_right": "open",
+  "language": "eng",
+  "notes": "License scope: author-generated source code is MIT; author-generated documentation, figures, configuration files, and derived TSV/JSON artifacts are CC BY 4.0. Third-party materials are excluded and remain governed by their providers' terms."
+}
