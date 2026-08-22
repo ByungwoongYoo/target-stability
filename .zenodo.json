@@ -8,5 +8,7 @@
   "version": "1.0.0",
   "access_right": "open",
   "language": "eng",
+  "publication_date": "2026-08-23",
+  "doi": "10.5281/zenodo.22059254",
   "notes": "License scope: author-generated source code is MIT; author-generated documentation, figures, configuration files, and derived TSV/JSON artifacts are CC BY 4.0. Third-party materials are excluded and remain governed by their providers' terms."
 }
