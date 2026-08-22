@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+type: software
+title: "Variant-level concordance can overstate exact peptide–HLA shortlist reproducibility: a 63-condition HCC1395 audit"
+authors:
+  - family-names: Yoo
+    given-names: Byungwoong
+    affiliation: "Independent Researcher, Seoul, Republic of Korea"
+    orcid: "https://orcid.org/0009-0002-1797-3100"
+version: 1.0.0
+date-released: 2026-08-23
+license: MIT
+repository-code: "https://github.com/ByungwoongYoo/target-stability"
+abstract: >-
+  Reproducibility software and frozen analytical artifacts for a 63-condition
+  HCC1395/HCC1395BL SEQC2 audit of computational neoantigen shortlist
+  stability. The release evaluates analytical concordance at variant,
+  peptide, and exact variant–peptide–HLA resolution. It nominates no biological
+  candidate and does not establish presentation, immunogenicity, efficacy,
+  safety, treatment benefit, or clinical utility.
+keywords:
+  - analytical reproducibility
+  - neoantigen prioritization
+  - peptide-HLA
+  - HLA provenance
+  - HCC1395
+  - SEQC2
+  - bioinformatics
+  - research software
