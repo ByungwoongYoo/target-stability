@@ -244,6 +244,47 @@ jobs:
               cc=cc.sort_values(["mean_pct","broad_contrast","sanger_contrast"])
               selective_candidates[g]=cc.head(30).to_dict("records")
 
+          # Pathway coherence for replicated Bowel-selective dependencies.
+          # Use the exact 15,008 tested genes as custom background.
+          bowel_sets={}
+          for q in [0.05,0.10]:
+              bvals=pd.Series({gene:broad_contrast["Bowel"][gene] for gene in common_all})
+              svals=pd.Series({gene:sanger_contrast["Bowel"][gene] for gene in common_all})
+              bc=bvals<=bvals.quantile(q); sc=svals<=svals.quantile(q)
+              bowel_sets[str(q)]=sorted(set(bvals.index[bc]) & set(svals.index[sc]))
+          print("BOWEL_SELECTIVE_SET_SIZES",{k:len(v) for k,v in bowel_sets.items()})
+
+          pathway={}
+          gpurl="https://biit.cs.ut.ee/gprofiler/api/gost/profile/"
+          for qstr,qgenes in bowel_sets.items():
+              payload={
+                  "organism":"hsapiens",
+                  "query":qgenes,
+                  "sources":["GO:BP","REAC","KEGG","WP"],
+                  "user_threshold":0.05,
+                  "significance_threshold_method":"fdr",
+                  "domain_scope":"custom",
+                  "background":common_all,
+                  "no_evidences":True
+              }
+              try:
+                  rr=requests.post(gpurl,json=payload,headers=UA,timeout=180)
+                  rr.raise_for_status()
+                  res=rr.json().get("result",[])
+                  keep=[]
+                  for z in res:
+                      keep.append({
+                          "source":z.get("source"),"native":z.get("native"),"name":z.get("name"),
+                          "p_value":z.get("p_value"),"intersection_size":z.get("intersection_size"),
+                          "term_size":z.get("term_size"),"query_size":z.get("query_size"),
+                          "effective_domain_size":z.get("effective_domain_size"),
+                          "precision":z.get("precision"),"recall":z.get("recall"),
+                          "intersections":z.get("intersections")
+                      })
+                  pathway[qstr]=keep[:50]
+              except Exception as e:
+                  pathway[qstr]=[{"error":repr(e)}]
+
           out={
               "broad_dome_crispr_models":bsel.groupby("group")["Model ID"].nunique().to_dict(),
               "broad_selected_screens":len(screen_ids),
@@ -265,7 +306,9 @@ jobs:
               "lineage_contrast_top_assignments":contrast_perms[:5],
               "lineage_contrast_flattened_matched_rho":float(contrast_flat_rho),
               "lineage_contrast_flattened_matched_p":float(contrast_flat_p),
-              "lineage_selective_consensus_candidates":selective_candidates
+              "lineage_selective_consensus_candidates":selective_candidates,
+              "bowel_selective_sets":bowel_sets,
+              "bowel_pathway_enrichment":pathway
           }
           print("=== O01_LINEAGE_RESULT ===")
           print(json.dumps(out,indent=2,default=str))
