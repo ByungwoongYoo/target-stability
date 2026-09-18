@@ -177,6 +177,73 @@ jobs:
               cc=cc.sort_values(["mean_pct","broad","sanger"])
               candidates[g]=cc.head(25).to_dict("records")
 
+          # Proper lineage-specific test: remove each gene's pan-lineage component within resource.
+          # For each lineage, contrast = lineage mean - mean(other three lineage means).
+          # More negative values indicate lineage-selective dependency rather than generic essentiality.
+          common_all=set(genes)
+          for g in groups:
+              common_all &= set(broad_means[g])
+              common_all &= set(sanger_means[g])
+          common_all=sorted(common_all)
+          print("CONTRAST_COMMON_GENES",len(common_all))
+
+          broad_contrast={g:{} for g in groups}
+          sanger_contrast={g:{} for g in groups}
+          for gene in common_all:
+              bv={g:float(broad_means[g][gene]) for g in groups}
+              sv={g:float(sanger_means[g][gene]) for g in groups}
+              for g in groups:
+                  broad_contrast[g][gene]=bv[g]-float(np.mean([bv[h] for h in groups if h!=g]))
+                  sanger_contrast[g][gene]=sv[g]-float(np.mean([sv[h] for h in groups if h!=g]))
+
+          contrast_matrix={}; contrast_detail={}
+          for bg in groups:
+              contrast_matrix[bg]={}
+              for sg in groups:
+                  x=np.array([broad_contrast[bg][gene] for gene in common_all],float)
+                  y=np.array([sanger_contrast[sg][gene] for gene in common_all],float)
+                  rho,rp=spearmanr(x,y); pr,pp=pearsonr(x,y)
+                  rec={"n":int(len(x)),"rho":float(rho),"rho_p":float(rp),"pearson":float(pr),"pearson_p":float(pp)}
+                  for q in [0.05,0.10,0.20]:
+                      bx=x<=np.quantile(x,q); sy=y<=np.quantile(y,q)
+                      a=int((bx&sy).sum()); b=int(bx.sum()-a); cc=int(sy.sum()-a); dd=int(len(x)-a-b-cc)
+                      OR,fp=fisher_exact([[a,b],[cc,dd]],alternative="greater")
+                      rec[f"bottom{int(q*100)}_overlap"]=a
+                      rec[f"bottom{int(q*100)}_OR"]=float(OR)
+                      rec[f"bottom{int(q*100)}_p"]=float(fp)
+                  contrast_matrix[bg][sg]=float(rho)
+                  contrast_detail[f"{bg}__{sg}"]=rec
+
+          contrast_obs=float(np.mean([contrast_matrix[g][g] for g in groups]))
+          contrast_perms=[]
+          for perm in itertools.permutations(groups):
+              score=float(np.mean([contrast_matrix[groups[i]][perm[i]] for i in range(len(groups))]))
+              contrast_perms.append({"perm":list(perm),"mean_rho":score})
+          contrast_perms=sorted(contrast_perms,key=lambda z:z["mean_rho"],reverse=True)
+          contrast_rank=1+sum(1 for z in contrast_perms if z["mean_rho"]>contrast_obs+1e-15)
+          contrast_exact_p=sum(1 for z in contrast_perms if z["mean_rho"]>=contrast_obs-1e-15)/len(contrast_perms)
+
+          # Flattened matched contrast correlation is descriptive (lineage contrasts are coupled within gene).
+          bx_flat=[]; sy_flat=[]
+          for g in groups:
+              bx_flat.extend([broad_contrast[g][gene] for gene in common_all])
+              sy_flat.extend([sanger_contrast[g][gene] for gene in common_all])
+          contrast_flat_rho,contrast_flat_p=spearmanr(bx_flat,sy_flat)
+
+          selective_candidates={}
+          for g in groups:
+              df=pd.DataFrame({
+                  "gene":common_all,
+                  "broad_contrast":[broad_contrast[g][gene] for gene in common_all],
+                  "sanger_contrast":[sanger_contrast[g][gene] for gene in common_all],
+              })
+              df["b_pct"]=df["broad_contrast"].rank(pct=True,method="average")
+              df["s_pct"]=df["sanger_contrast"].rank(pct=True,method="average")
+              cc=df[(df.b_pct<=.10)&(df.s_pct<=.10)].copy()
+              cc["mean_pct"]=(cc.b_pct+cc.s_pct)/2
+              cc=cc.sort_values(["mean_pct","broad_contrast","sanger_contrast"])
+              selective_candidates[g]=cc.head(30).to_dict("records")
+
           out={
               "broad_dome_crispr_models":bsel.groupby("group")["Model ID"].nunique().to_dict(),
               "broad_selected_screens":len(screen_ids),
@@ -188,7 +255,17 @@ jobs:
               "canonical_assignment_rank_of_24":rank,
               "assignment_exact_p":float(exact_p),
               "top_assignments":perms[:5],
-              "matched_consensus_candidates":candidates
+              "matched_consensus_candidates":candidates,
+              "lineage_contrast_common_genes":len(common_all),
+              "lineage_contrast_spearman_matrix":contrast_matrix,
+              "lineage_contrast_pair_details":contrast_detail,
+              "lineage_contrast_canonical_mean_rho":contrast_obs,
+              "lineage_contrast_canonical_assignment_rank_of_24":contrast_rank,
+              "lineage_contrast_assignment_exact_p":float(contrast_exact_p),
+              "lineage_contrast_top_assignments":contrast_perms[:5],
+              "lineage_contrast_flattened_matched_rho":float(contrast_flat_rho),
+              "lineage_contrast_flattened_matched_p":float(contrast_flat_p),
+              "lineage_selective_consensus_candidates":selective_candidates
           }
           print("=== O01_LINEAGE_RESULT ===")
           print(json.dumps(out,indent=2,default=str))
