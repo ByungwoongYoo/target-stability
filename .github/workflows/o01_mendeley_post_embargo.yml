@@ -1,0 +1,75 @@
+name: O01 Mendeley post-embargo probe
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  mendeley:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl
+      - name: Probe public API and inspect Data S5
+        shell: bash
+        run: |
+          cat > /tmp/mend.py <<'PY'
+          import io,json,os,re,zipfile
+          import requests,pandas as pd
+          base="https://data.mendeley.com/public-api/datasets/hr94h42xdc/files"
+          params={"folder_id":"root","version":"3"}
+          h={"User-Agent":"Mozilla/5.0 (compatible; O01-research/0.1)"}
+          r=requests.get(base,params=params,headers=h,timeout=120)
+          print("FILE_LIST_STATUS",r.status_code,r.url)
+          print("FILE_LIST_CTYPE",r.headers.get("content-type"))
+          print("FILE_LIST_PREFIX",r.text[:2000])
+          r.raise_for_status()
+          files=r.json()
+          if isinstance(files,dict):
+              for k in ["results","files","items"]:
+                  if isinstance(files.get(k),list): files=files[k]; break
+          print("FILE_COUNT",len(files))
+          slim=[]
+          for f in files:
+              slim.append({
+                "id":f.get("id"),"filename":f.get("filename") or f.get("name"),
+                "size":f.get("size") or f.get("file_size"),
+                "mime":f.get("mime_type"),
+                "download_url":(f.get("content_details") or {}).get("download_url") or f.get("download_url")
+              })
+          print("FILES",json.dumps(slim,indent=2,default=str))
+          cand=[x for x in slim if re.search(r"(s5|dss|drug.?sensitivity.?score)",str(x["filename"]),re.I)]
+          print("S5_CANDIDATES",json.dumps(cand,indent=2))
+          if not cand:
+              raise RuntimeError("No S5/DSS filename found")
+          x=cand[0]
+          u=x["download_url"]
+          if not u: raise RuntimeError("No download_url for S5 candidate")
+          q=requests.get(u,headers=h,timeout=180)
+          print("S5_DOWNLOAD_STATUS",q.status_code,"BYTES",len(q.content),"CTYPE",q.headers.get("content-type"))
+          q.raise_for_status()
+          name=str(x["filename"] or "").lower()
+          data=q.content
+          if name.endswith(".xlsx") or data[:2]==b"PK":
+              xf=pd.ExcelFile(io.BytesIO(data))
+              print("S5_SHEETS",xf.sheet_names)
+              for sh in xf.sheet_names:
+                  df=pd.read_excel(io.BytesIO(data),sheet_name=sh)
+                  print("S5_SHEET",sh,"SHAPE",df.shape)
+                  print("S5_COLUMNS",json.dumps([str(c) for c in df.columns[:100]]))
+                  print("S5_HEAD",df.head(8).to_json(orient="records"))
+          else:
+              try:
+                  df=pd.read_csv(io.BytesIO(data))
+              except Exception:
+                  df=pd.read_csv(io.BytesIO(data),sep="\t")
+              print("S5_SHAPE",df.shape)
+              print("S5_COLUMNS",json.dumps([str(c) for c in df.columns[:150]]))
+              print("S5_HEAD",df.head(8).to_json(orient="records"))
+          PY
+          python /tmp/mend.py
