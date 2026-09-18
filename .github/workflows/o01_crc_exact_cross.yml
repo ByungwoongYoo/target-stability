@@ -95,13 +95,13 @@ jobs:
               obj=bpost(f"datasets/matrix/{DSID}",{
                   "sample_identifier":"id",
                   "samples":sorted(set(ids)),
-                  "aggregate":{"aggregate_by":"samples","aggregation":["mean","count"]}
+                  "aggregate":{"aggregate_by":"samples","aggregation":"mean"}
               })
               mean=obj["mean"]; cnt=obj["count"]
               rows=[]
               for k,v in mean.items():
                   gene=fmap.get(str(k),str(k))
-                  rows.append({"gene":gene,name:v,name+"_n":cnt.get(k)})
+                  rows.append({"gene":gene,name:v})
               out=pd.DataFrame(rows)
               print(name,"GENES",len(out),"COUNT_RANGE",
                     [int(pd.to_numeric(out[name+"_n"]).min()),int(pd.to_numeric(out[name+"_n"]).max())])
