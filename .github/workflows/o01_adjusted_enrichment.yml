@@ -1,0 +1,172 @@
+name: O01 adjusted oncology enrichment
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  adjusted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl scipy pyarrow statsmodels
+      - name: Run adjusted oncology analysis
+        shell: bash
+        run: |
+          cat > /tmp/o01_adjusted.py <<'PY'
+          import io, json, zipfile, urllib.parse, xml.etree.ElementTree as ET
+          import requests, pandas as pd, numpy as np, pyarrow.parquet as pq
+          from scipy.stats import fisher_exact
+          from statsmodels.stats.contingency_tables import StratifiedTable
+
+          UA={"User-Agent":"o01-adjusted/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          S3ROOT="https://open-targets-public-data-releases.s3.amazonaws.com/"
+          NS={"s3":"http://s3.amazonaws.com/doc/2006-03-01/"}
+          def get(url,**kw):
+              h=UA.copy(); h.update(kw.pop("headers",{}))
+              r=requests.get(url,headers=h,timeout=240,**kw); r.raise_for_status(); return r
+          def list_keys(prefix):
+              keys=[]; token=None
+              while True:
+                  params={"list-type":"2","prefix":prefix,"max-keys":"1000"}
+                  if token: params["continuation-token"]=token
+                  root=ET.fromstring(get(S3ROOT,params=params).content)
+                  keys += [x.find("s3:Key",NS).text for x in root.findall("s3:Contents",NS)]
+                  if root.findtext("s3:IsTruncated",default="false",namespaces=NS)!="true": break
+                  token=root.findtext("s3:NextContinuationToken",default=None,namespaces=NS)
+              return keys
+          def read_dataset(name,wanted=None):
+              keys=[k for k in list_keys(f"platform/26.06/output/{name}/") if k.endswith(".parquet")]
+              fs=[]; schema=None
+              for k in keys:
+                  tab=pq.read_table(io.BytesIO(get(S3ROOT+urllib.parse.quote(k,safe="/")).content))
+                  if schema is None: schema=tab.schema.names
+                  cols=[c for c in (wanted or tab.schema.names) if c in tab.schema.names]
+                  fs.append(tab.select(cols).to_pandas())
+              return pd.concat(fs,ignore_index=True),schema
+
+          # frozen classes exactly: Broad source + Sanger Table5/Table6 inner join + Broad-overlap exclusion
+          burl=("https://media.springernature.com/original/springer-static/esm/"
+                "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM12_ESM.xlsx")
+          broad=pd.read_excel(io.BytesIO(get(burl).content),sheet_name="Fig5b diff deps volcano")
+          broad=broad[["GeneSymbol","OrganoidsMean","AdherentMean","Cluster"]].copy()
+          broad["gene"]=broad["GeneSymbol"].astype(str).str.strip()
+          broad=broad.dropna(subset=["gene","OrganoidsMean","AdherentMean"]).drop_duplicates("gene")
+          surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
+                "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
+          z=zipfile.ZipFile(io.BytesIO(get(surl).content))
+          meta=pd.read_excel(io.BytesIO(z.read("supplementary_table_2_revision.xlsx")),sheet_name="data_availability")
+          t5=pd.read_csv(io.BytesIO(z.read("supplementary_table_5_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","is_depleted"])
+          t6=pd.read_csv(io.BytesIO(z.read("supplementary_table_6_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","LFC"])
+          meta["sample_ID"]=meta["sample_ID"].astype(str)
+          screened=meta[meta["CRISPR_available"].astype(str).str.lower().eq("yes")].copy()
+          def yes(s): return s.astype(str).str.lower().isin(["yes","true","1"])
+          x=t6.merge(t5,on=["sample_ID","gene","library"],how="inner",validate="one_to_one")
+          pm=x.groupby(["sample_ID","gene"],as_index=False).agg(LFC=("LFC","mean"))
+          pm=pm.merge(screened[["sample_ID","overlap_Broad_DepMap"]],on="sample_ID",how="inner",validate="many_to_one")
+          sg=(pm[~yes(pm["overlap_Broad_DepMap"])].groupby("gene",as_index=False)
+              .agg(sanger_mean_LFC=("LFC","mean")))
+          d=broad.merge(sg,on="gene",how="inner").dropna().copy()
+          q=.10
+          d["b3"]=d.OrganoidsMean<=d.OrganoidsMean.quantile(q)
+          d["s3"]=d.sanger_mean_LFC<=d.sanger_mean_LFC.quantile(q)
+          d["b2"]=d.AdherentMean<=d.AdherentMean.quantile(q)
+          d["subclass"]=np.select(
+              [d.b2 & d.b3 & d.s3, ~d.b2 & d.b3 & d.s3, d.b2 & ~d.b3 & ~d.s3],
+              ["UNIVERSAL_2D_BOTH3D","THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY"],default="OTHER")
+          study=d[d.subclass.isin(["UNIVERSAL_2D_BOTH3D","THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY"])].copy()
+
+          # OT mappings, essentiality, cancer diseases, clinical precedence
+          targets,_=read_dataset("target",["id","approvedSymbol"])
+          targets=targets.dropna(subset=["id","approvedSymbol"]).drop_duplicates("id")
+          ess,ess_schema=read_dataset("target_essentiality",["targetId","isEssential"])
+          print("ESS_SCHEMA",ess_schema,"ESS_ROWS",len(ess))
+          ess["isEssential"]=ess["isEssential"].fillna(False).astype(bool)
+          diseases,_=read_dataset("disease",["id","therapeuticAreas","ancestors"])
+          cancer="MONDO_0045024"
+          def is_cancer(r):
+              vals=[]
+              for c in ["therapeuticAreas","ancestors"]:
+                  v=r.get(c)
+                  if isinstance(v,(list,tuple,np.ndarray)): vals += [str(x) for x in v]
+              return str(r.get("id"))==cancer or cancer in vals
+          cancer_ids=set(diseases.loc[diseases.apply(is_cancer,axis=1),"id"].astype(str))
+          ev,_=read_dataset("evidence_clinical_precedence",["targetId","diseaseId","clinicalStage","drugId"])
+          ev=ev[ev.diseaseId.astype(str).isin(cancer_ids)].copy()
+          rank={"UNKNOWN":0.0,"PRECLINICAL":0.1,"IND":0.5,"EARLY_PHASE_1":0.75,
+                "PHASE_1":1.0,"PHASE_1_2":1.5,"PHASE_2":2.0,"PHASE_2_3":2.5,
+                "PHASE_3":3.0,"PREAPPROVAL":3.5,"APPROVAL":4.0,"PHASE_4":4.0,"WITHDRAWAL":4.0}
+          ev["stage"]=ev.clinicalStage.astype(str).map(rank).fillna(0.0)
+          evs=ev.merge(targets,left_on="targetId",right_on="id",how="left")
+          mx=evs.dropna(subset=["approvedSymbol"]).groupby("approvedSymbol",as_index=False).agg(max_stage=("stage","max"))
+
+          # map essentiality at approved-symbol grain: any mapped ENSG flagged essential => essential
+          es=ess.merge(targets,left_on="targetId",right_on="id",how="left")
+          esym=(es.dropna(subset=["approvedSymbol"]).groupby("approvedSymbol",as_index=False)
+                .agg(isEssential=("isEssential","max")))
+
+          g=study.merge(mx,left_on="gene",right_on="approvedSymbol",how="left").drop(columns=["approvedSymbol"],errors="ignore")
+          g=g.merge(esym,left_on="gene",right_on="approvedSymbol",how="left").drop(columns=["approvedSymbol"],errors="ignore")
+          g["max_stage"]=g["max_stage"].fillna(0.0)
+          g["isEssential"]=g["isEssential"].fillna(False).astype(bool)
+          g["phase3plus"]=g.max_stage>=3.0
+          g["phase2plus"]=g.max_stage>=2.0
+          g["approval"]=g.max_stage>=4.0
+
+          def two_group(df,a_name,b_name,endpoint):
+              a=df[df.subclass.eq(a_name)]; b=df[df.subclass.eq(b_name)]
+              ae=int(a[endpoint].sum()); be=int(b[endpoint].sum())
+              OR,p=fisher_exact([[ae,len(a)-ae],[be,len(b)-be]],alternative="two-sided")
+              return {"a":a_name,"b":b_name,"endpoint":endpoint,
+                      "a_n":len(a),"a_event":ae,"a_rate":ae/len(a) if len(a) else None,
+                      "b_n":len(b),"b_event":be,"b_rate":be/len(b) if len(b) else None,
+                      "OR":float(OR),"p":float(p)}
+
+          results={"class_counts":g.subclass.value_counts().to_dict(),
+                   "essentiality":g.groupby("subclass").isEssential.agg(["sum","count","mean"]).to_dict("index"),
+                   "unadjusted":[],
+                   "nonessential_only":[],
+                   "mh_2dstrength_essentiality":{}}
+          for ep in ["phase2plus","phase3plus","approval"]:
+              results["unadjusted"].append(two_group(g,"UNIVERSAL_2D_BOTH3D","TWO_D_ONLY",ep))
+              results["unadjusted"].append(two_group(g,"THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY",ep))
+              ne=g[~g.isEssential].copy()
+              results["nonessential_only"].append(two_group(ne,"UNIVERSAL_2D_BOTH3D","TWO_D_ONLY",ep))
+              results["nonessential_only"].append(two_group(ne,"THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY",ep))
+
+          # Mantel-Haenszel: among Broad 2D hits only, stratify by 2D effect quintile x essentiality
+          uv=g[g.subclass.isin(["UNIVERSAL_2D_BOTH3D","TWO_D_ONLY"])].copy()
+          uv["replicated3d"]=uv.subclass.eq("UNIVERSAL_2D_BOTH3D")
+          # rank-based quintiles avoid duplicate-edge issues
+          uv["b2_bin"]=pd.qcut(uv.AdherentMean.rank(method="first"),5,labels=False)
+          uv["stratum"]=uv["b2_bin"].astype(str)+"_"+uv.isEssential.astype(int).astype(str)
+          for ep in ["phase2plus","phase3plus","approval"]:
+              tabs=[]; used=[]
+              for s,zs in uv.groupby("stratum"):
+                  # rows exposure replicated3d yes/no, cols event yes/no
+                  a=int((zs.replicated3d & zs[ep]).sum())
+                  b=int((zs.replicated3d & ~zs[ep]).sum())
+                  c=int((~zs.replicated3d & zs[ep]).sum())
+                  dd=int((~zs.replicated3d & ~zs[ep]).sum())
+                  if (a+b)>0 and (c+dd)>0:
+                      tabs.append(np.array([[a,b],[c,dd]],dtype=float)); used.append(s)
+              st=StratifiedTable(tabs)
+              test=st.test_null_odds()
+              results["mh_2dstrength_essentiality"][ep]={
+                  "pooled_OR":float(st.oddsratio_pooled),
+                  "p":float(test.pvalue),
+                  "strata_used":len(tabs)
+              }
+
+          print("=== O01_ADJUSTED_RESULT ===")
+          print(json.dumps(results,indent=2,default=str))
+          PY
+          python /tmp/o01_adjusted.py
