@@ -1,0 +1,119 @@
+name: O01 Bowel candidate triage
+
+on:
+  push:
+    branches:
+      - o01-lineage-scratch-20260919
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas pyarrow
+      - name: Rank CRC-selective replicated candidates
+        shell: bash
+        run: |
+          cat > /tmp/triage.py <<'PY'
+          import io, json, urllib.parse, xml.etree.ElementTree as ET
+          import requests, pandas as pd, numpy as np, pyarrow.parquet as pq
+
+          CANDS=["HSPA8","EED","SLC4A7","CDIN1","COX15","EZH2","HNF4A","COX6B1","SUZ12","CDK4",
+                 "TIMMDC1","SATB2","ORC3","PCM1","WRN","MTERF4","FERMT1","PDSS2","COA6","GATB",
+                 "DLD","COQ3","SAMD4B","MRPS18C","NDUFA1","FASTKD5","STXBP3","TFB1M","RALGAPB","MRPL52"]
+          UA={"User-Agent":"o01-candidate-triage/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+
+          def epmc_count(q):
+              url="https://www.ebi.ac.uk/europepmc/webservices/rest/search"
+              r=requests.get(url,params={"query":q,"format":"json","pageSize":1},headers=UA,timeout=60)
+              r.raise_for_status()
+              return int(r.json().get("hitCount",0))
+
+          lit={}
+          for i,g in enumerate(CANDS):
+              base=f'TITLE_ABS:"{g}" AND (TITLE_ABS:colorectal OR TITLE_ABS:"colon cancer" OR TITLE_ABS:"rectal cancer" OR TITLE_ABS:"colorectal cancer")'
+              dep=base+' AND (TITLE_ABS:CRISPR OR TITLE_ABS:dependency OR TITLE_ABS:essential OR TITLE_ABS:vulnerability OR TITLE_ABS:knockout OR TITLE_ABS:knockdown)'
+              org=base+' AND TITLE_ABS:organoid'
+              try:
+                  lit[g]={"crc":epmc_count(base),"functional":epmc_count(dep),"organoid":epmc_count(org)}
+              except Exception as e:
+                  lit[g]={"error":repr(e)}
+              print("LIT",i+1,g,lit[g])
+
+          # Open Targets 26.06 target annotation
+          ROOT="https://open-targets-public-data-releases.s3.amazonaws.com/"
+          NS={"s3":"http://s3.amazonaws.com/doc/2006-03-01/"}
+          def get(url,**kw):
+              r=requests.get(url,headers=UA,timeout=180,**kw); r.raise_for_status(); return r
+          def list_keys(prefix):
+              root=ET.fromstring(get(ROOT,params={"list-type":"2","prefix":prefix,"max-keys":"1000"}).content)
+              return [x.find("s3:Key",NS).text for x in root.findall("s3:Contents",NS)
+                      if x.find("s3:Key",NS).text.endswith(".parquet")]
+          keys=list_keys("platform/26.06/output/target/")
+          frames=[]
+          wanted=["id","approvedSymbol","approvedName","tractability","geneEssentiality","targetClass"]
+          for k in keys:
+              tab=pq.read_table(io.BytesIO(get(ROOT+urllib.parse.quote(k,safe="/")).content))
+              cols=[x for x in wanted if x in tab.schema.names]
+              frames.append(tab.select(cols).to_pandas())
+          t=pd.concat(frames,ignore_index=True)
+          t=t[t.approvedSymbol.isin(CANDS)].copy()
+
+          def walk_essential(v):
+              flags=[]
+              def walk(x):
+                  if isinstance(x,dict):
+                      if x.get("isEssential") is not None: flags.append(bool(x.get("isEssential")))
+                      for y in x.values(): walk(y)
+                  elif isinstance(x,(list,tuple,np.ndarray)):
+                      for y in x: walk(y)
+              walk(v); return any(flags)
+
+          def true_tract(v):
+              out=[]
+              if isinstance(v,(list,tuple,np.ndarray)):
+                  for x in v:
+                      if isinstance(x,dict) and bool(x.get("value")):
+                          out.append({"id":x.get("id"),"label":x.get("label"),"modality":x.get("modality")})
+              return out
+
+          ot={}
+          for _,r in t.iterrows():
+              g=str(r.approvedSymbol)
+              tr=true_tract(r.get("tractability"))
+              ot[g]={
+                  "ensembl":str(r.get("id")),
+                  "name":str(r.get("approvedName")),
+                  "essential":walk_essential(r.get("geneEssentiality")),
+                  "tractability_true":tr,
+                  "sm_true":[x for x in tr if str(x.get("modality","")).upper() in ["SM","SMALLMOLECULE","SMALL MOLECULE"]],
+                  "targetClass":str(r.get("targetClass"))[:2000]
+              }
+
+          # Manual evidence strength from the already verified cross-resource residual ranking:
+          # ordering here is the combined-percentile rank among displayed Bowel top30.
+          rows=[]
+          for rank,g in enumerate(CANDS,1):
+              x={"gene":g,"cross_resource_rank":rank}
+              x.update(lit.get(g,{})); x.update(ot.get(g,{}))
+              # Transparent triage score: fewer prior functional CRC papers preferred;
+              # essentiality penalized; any true SM tractability adds one. This is only triage, not a claim.
+              func=x.get("functional",999)
+              crc=x.get("crc",999)
+              score=(5 if func==0 else 3 if func<=1 else 1 if func<=3 else 0)
+              score+=(2 if crc==0 else 1 if crc<=2 else 0)
+              score+=(2 if len(x.get("sm_true",[]))>0 else 0)
+              score-= (4 if x.get("essential",False) else 0)
+              score+= max(0,3-(rank-1)//10)
+              x["triage_score"]=score
+              rows.append(x)
+          rows=sorted(rows,key=lambda z:(-z["triage_score"],z["functional"] if isinstance(z.get("functional"),int) else 999,
+                                         z["crc"] if isinstance(z.get("crc"),int) else 999,z["cross_resource_rank"]))
+          print("=== O01_BOWEL_TRIAGE ===")
+          print(json.dumps(rows,indent=2,default=str))
+          PY
+          python /tmp/triage.py
