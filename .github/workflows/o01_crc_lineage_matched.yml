@@ -1,0 +1,315 @@
+name: O01 CRC lineage-matched analysis
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  crc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl scipy pyarrow statsmodels
+      - name: Run fully lineage-matched Broad CRC vs Sanger CRC analysis
+        shell: bash
+        run: |
+          cat > /tmp/o01_crc.py <<'PY'
+          import io, json, zipfile, urllib.parse, xml.etree.ElementTree as ET, time, re
+          import requests, pandas as pd, numpy as np, pyarrow.parquet as pq
+          from scipy.stats import spearmanr, pearsonr, fisher_exact, mannwhitneyu
+          import statsmodels.api as sm
+          from statsmodels.formula.api import glm
+
+          UA={"User-Agent":"o01-crc-lineage/0.2 (+https://github.com/ByungwoongYoo/target-stability)",
+              "Accept":"application/json"}
+          BB="https://depmap.org/portal/breadbox"
+          DSID="fa1b635a-5116-4a93-b66d-84eca7e2a402"
+          S3ROOT="https://open-targets-public-data-releases.s3.amazonaws.com/"
+          NS={"s3":"http://s3.amazonaws.com/doc/2006-03-01/"}
+
+          def request(method,url,**kw):
+              headers=UA.copy(); headers.update(kw.pop("headers",{}))
+              err=None
+              for a in range(7):
+                  try:
+                      r=requests.request(method,url,headers=headers,timeout=240,**kw)
+                      if r.status_code < 500:
+                          r.raise_for_status(); return r
+                      err=RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+                  except Exception as e: err=e
+                  time.sleep(2*(a+1))
+              raise err
+
+          def bb_get(ep,params=None): return request("GET",BB+"/"+ep.lstrip("/"),params=params).json()
+          def bb_post(ep,body): return request("POST",BB+"/"+ep.lstrip("/"),json=body).json()
+          def get(url,**kw): return request("GET",url,**kw)
+
+          def dataset_info(given_or_id):
+              try: return bb_get(f"datasets/{given_or_id}")
+              except Exception:
+                  ds=bb_get("datasets/")
+                  for x in ds:
+                      if x.get("id")==given_or_id or x.get("given_id")==given_or_id:
+                          return x
+                  raise
+
+          def mapping_frame(raw,index_name):
+              ids=set()
+              for v in raw.values():
+                  if isinstance(v,dict): ids.update(map(str,v.keys()))
+              rows=[]
+              for i in sorted(ids):
+                  row={index_name:i}
+                  for c,v in raw.items():
+                      if isinstance(v,dict): row[c]=v.get(i)
+                  rows.append(row)
+              return pd.DataFrame(rows)
+
+          # --- Broad NextGen screen -> ModelCondition -> Model mapping
+          sinfo=dataset_info("screen_nextgen_metadata")
+          minfo=dataset_info("modelcondition_metadata")
+          scols=list((sinfo.get("columns_metadata") or {}).keys())
+          mcols=list((minfo.get("columns_metadata") or {}).keys())
+          print("SCREEN_META_COLUMNS",scols)
+          print("MODELCONDITION_META_COLUMNS",mcols)
+
+          def ref_col(cols_meta,needle):
+              for c,m in (cols_meta or {}).items():
+                  if needle.lower() in str((m or {}).get("references","")).lower():
+                      return c
+              return None
+          scond=("ModelConditionID" if "ModelConditionID" in scols else
+                 ref_col(sinfo.get("columns_metadata"),"modelcondition") or
+                 next((c for c in scols if "modelcondition" in c.lower()),None))
+          mmodel=(next((c for c in ["ModelID","DepMap_ID","DepMapID","model_id"] if c in mcols),None) or
+                  ref_col(minfo.get("columns_metadata"),"depmap_model") or
+                  next((c for c in mcols if "model" in c.lower() and "condition" not in c.lower()),None))
+          if not scond or not mmodel:
+              raise RuntimeError(f"Could not identify mapping columns scond={scond} mmodel={mmodel}")
+
+          sraw=bb_post("datasets/tabular/screen_nextgen_metadata",{"columns":list(dict.fromkeys(["label",scond]))})
+          mraw=bb_post("datasets/tabular/modelcondition_metadata",{"columns":list(dict.fromkeys(["label",mmodel]))})
+          sdf=mapping_frame(sraw,"screen_id")
+          mdf=mapping_frame(mraw,"modelcondition_id")
+          sdf["screen_id"]=sdf["screen_id"].astype(str)
+          sdf[scond]=sdf[scond].astype(str)
+          mdf["modelcondition_id"]=mdf["modelcondition_id"].astype(str)
+          mdf[mmodel]=mdf[mmodel].astype(str)
+          smap=sdf.merge(mdf[["modelcondition_id",mmodel]],left_on=scond,right_on="modelcondition_id",how="left")
+          smap= smap.rename(columns={mmodel:"model_id"})
+          print("SCREEN_ROWS",len(sdf),"MODELCONDITION_ROWS",len(mdf),"SCREEN_MODEL_MAPPED",int(smap.model_id.notna().sum()))
+          print("SCREEN_SAMPLE_HEAD",smap.head(12).to_dict("records"))
+
+          # Official Broad supplementary model metadata
+          burl=("https://media.springernature.com/original/springer-static/esm/"
+                "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM3_ESM.xlsx")
+          bmeta=pd.read_excel(io.BytesIO(get(burl).content),sheet_name="NextGen Model Metadata")
+          bmeta["Model ID"]=bmeta["Model ID"].astype(str)
+          print("BROAD_LINEAGE_COUNTS",bmeta["Lineage"].astype(str).value_counts(dropna=False).to_dict())
+          print("BROAD_FORMAT_COUNTS",bmeta["Culture Format"].astype(str).value_counts(dropna=False).to_dict())
+          print("BROAD_CRISPR_COUNTS",bmeta["HasCRISPRData"].astype(str).value_counts(dropna=False).to_dict())
+
+          crispr=bmeta["HasCRISPRData"].astype(str).str.lower().isin(["yes","true","1","y"])
+          crc=bmeta["Lineage"].astype(str).str.lower().str.contains(r"colorectal|colon|rect|bowel",regex=True)
+          fmt=bmeta["Culture Format"].astype(str).str.lower()
+          is3=fmt.str.contains(r"organoid|3d",regex=True)
+          is2=fmt.str.contains(r"adherent|2d",regex=True)
+          if int((crispr&crc&is3).sum())==0 or int((crispr&crc&is2).sum())==0:
+              raise RuntimeError("CRC 3D/2D model selection empty; inspect printed lineage/format counts")
+          crc3_models=set(bmeta.loc[crispr&crc&is3,"Model ID"].astype(str))
+          crc2_models=set(bmeta.loc[crispr&crc&is2,"Model ID"].astype(str))
+
+          # Only keep screen IDs actually indexed in the matrix
+          samples=bb_get(f"datasets/samples/{DSID}")
+          matrix_sample_ids=set(str(x["id"]) for x in samples)
+          crc3_screens=sorted(set(smap.loc[smap.model_id.astype(str).isin(crc3_models),"screen_id"]) & matrix_sample_ids)
+          crc2_screens=sorted(set(smap.loc[smap.model_id.astype(str).isin(crc2_models),"screen_id"]) & matrix_sample_ids)
+          print("BROAD_CRC_SELECTION",json.dumps({
+              "crc3_models":len(crc3_models),"crc2_models":len(crc2_models),
+              "crc3_screens":len(crc3_screens),"crc2_screens":len(crc2_screens),
+              "matrix_samples":len(matrix_sample_ids)}))
+          if not crc3_screens or not crc2_screens:
+              raise RuntimeError("No matrix screens after Broad CRC mapping")
+
+          def aggregate_screens(screen_ids,label):
+              body={"sample_identifier":"id","samples":screen_ids,
+                    "feature_identifier":"label","features":None,
+                    "aggregate":{"aggregate_by":"samples","aggregation":["mean","count"]}}
+              obj=bb_post(f"datasets/matrix/{DSID}",body)
+              mean=obj.get("mean",{}); count=obj.get("count",{})
+              print(label,"AGG_GENES",len(mean),"COUNT_RANGE",
+                    [min(count.values()) if count else None,max(count.values()) if count else None])
+              return pd.DataFrame({"gene":list(mean.keys()),
+                                   label:[mean[k] for k in mean],
+                                   label+"_n":[count.get(k) for k in mean]})
+          b3=aggregate_screens(crc3_screens,"BroadCRC3D")
+          b2=aggregate_screens(crc2_screens,"BroadCRC2D")
+
+          # --- Sanger CRC, excluding models explicitly overlapping Broad
+          surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
+                "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
+          z=zipfile.ZipFile(io.BytesIO(get(surl).content))
+          meta=pd.read_excel(io.BytesIO(z.read("supplementary_table_2_revision.xlsx")),sheet_name="data_availability")
+          t5=pd.read_csv(io.BytesIO(z.read("supplementary_table_5_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","is_depleted"])
+          t6=pd.read_csv(io.BytesIO(z.read("supplementary_table_6_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","LFC"])
+          meta["sample_ID"]=meta["sample_ID"].astype(str)
+          scr=meta[meta["CRISPR_available"].astype(str).str.lower().eq("yes")].copy()
+          s_crc=scr["primary_tumour_type"].astype(str).str.lower().eq("colorectal")
+          overlap=scr["overlap_Broad_DepMap"].astype(str).str.lower().isin(["yes","true","1"])
+          keep=set(scr.loc[s_crc & ~overlap,"sample_ID"].astype(str))
+          x=t6.merge(t5,on=["sample_ID","gene","library"],how="inner",validate="one_to_one")
+          x["sample_ID"]=x["sample_ID"].astype(str)
+          x=x[x.sample_ID.isin(keep)]
+          per=x.groupby(["sample_ID","gene"],as_index=False).agg(LFC=("LFC","mean"))
+          sg=per.groupby("gene",as_index=False).agg(SangerCRC3D=("LFC","mean"),SangerCRC3D_n=("sample_ID","nunique"))
+          print("SANGER_CRC_NONOVERLAP_MODELS",len(keep),"SANGER_CRC_GENES",sg.gene.nunique())
+
+          d=b3.merge(b2,on="gene",how="inner").merge(sg,on="gene",how="inner")
+          for c in ["BroadCRC3D","BroadCRC2D","SangerCRC3D"]:
+              d[c]=pd.to_numeric(d[c],errors="coerce")
+          d=d.dropna(subset=["BroadCRC3D","BroadCRC2D","SangerCRC3D"]).copy()
+          rho3,p3=spearmanr(d.BroadCRC3D,d.SangerCRC3D)
+          r3,pr3=pearsonr(d.BroadCRC3D,d.SangerCRC3D)
+          rho2,p2=spearmanr(d.BroadCRC2D,d.SangerCRC3D)
+          print("CRC_SHARED_GENES",len(d),"CRC3D_SANGER_RHO",rho3,"CRC3D_SANGER_PEARSON",r3,
+                "CRC2D_SANGER_RHO",rho2)
+
+          # --- Open Targets helpers
+          def list_keys(prefix):
+              keys=[]; token=None
+              while True:
+                  params={"list-type":"2","prefix":prefix,"max-keys":"1000"}
+                  if token: params["continuation-token"]=token
+                  root=ET.fromstring(get(S3ROOT,params=params).content)
+                  keys += [x.find("s3:Key",NS).text for x in root.findall("s3:Contents",NS)]
+                  if root.findtext("s3:IsTruncated",default="false",namespaces=NS)!="true": break
+                  token=root.findtext("s3:NextContinuationToken",default=None,namespaces=NS)
+              return keys
+          def read_dataset(name,wanted=None):
+              keys=[k for k in list_keys(f"platform/26.06/output/{name}/") if k.endswith(".parquet")]
+              fs=[]
+              for k in keys:
+                  tab=pq.read_table(io.BytesIO(get(S3ROOT+urllib.parse.quote(k,safe="/")).content))
+                  cols=[c for c in (wanted or tab.schema.names) if c in tab.schema.names]
+                  fs.append(tab.select(cols).to_pandas())
+              return pd.concat(fs,ignore_index=True)
+
+          targets=read_dataset("target",["id","approvedSymbol"]).dropna(subset=["id","approvedSymbol"]).drop_duplicates("id")
+          ess=read_dataset("target_essentiality",["id","geneEssentiality"])
+          def essential_flag(v):
+              flags=[]
+              def walk(x):
+                  if isinstance(x,dict):
+                      if x.get("isEssential") is not None: flags.append(bool(x["isEssential"]))
+                      for vv in x.values(): walk(vv)
+                  elif isinstance(x,(list,tuple,np.ndarray)):
+                      for vv in x: walk(vv)
+              walk(v); return any(flags)
+          ess["isEssential"]=ess.geneEssentiality.map(essential_flag)
+          es=ess.merge(targets,on="id",how="left")
+          esym=(es.dropna(subset=["approvedSymbol"]).groupby("approvedSymbol",as_index=False)
+                .agg(isEssential=("isEssential","max")))
+
+          diseases=read_dataset("disease",["id","therapeuticAreas","ancestors"])
+          cancer="MONDO_0045024"
+          def is_cancer(row):
+              vals=[]
+              for c in ["therapeuticAreas","ancestors"]:
+                  v=row.get(c)
+                  if isinstance(v,(list,tuple,np.ndarray)): vals += [str(x) for x in v]
+              return str(row.get("id"))==cancer or cancer in vals
+          cancer_ids=set(diseases.loc[diseases.apply(is_cancer,axis=1),"id"].astype(str))
+          ev=read_dataset("evidence_clinical_precedence",["targetId","diseaseId","clinicalStage","drugId"])
+          ev=ev[ev.diseaseId.astype(str).isin(cancer_ids)].copy()
+          rank={"UNKNOWN":0.0,"PRECLINICAL":0.1,"IND":0.5,"EARLY_PHASE_1":0.75,
+                "PHASE_1":1.0,"PHASE_1_2":1.5,"PHASE_2":2.0,"PHASE_2_3":2.5,
+                "PHASE_3":3.0,"PREAPPROVAL":3.5,"APPROVAL":4.0,"PHASE_4":4.0,"WITHDRAWAL":4.0}
+          ev["stage"]=ev.clinicalStage.astype(str).map(rank).fillna(0)
+          mx=(ev.merge(targets,left_on="targetId",right_on="id",how="left")
+              .dropna(subset=["approvedSymbol"]).groupby("approvedSymbol",as_index=False)
+              .agg(max_stage=("stage","max")))
+
+          results={
+            "broad_crc":{"crc3_models":len(crc3_models),"crc2_models":len(crc2_models),
+                         "crc3_screens":len(crc3_screens),"crc2_screens":len(crc2_screens)},
+            "sanger_crc_nonoverlap_models":len(keep),
+            "shared_genes":int(len(d)),
+            "correlations":{"crc3_vs_sanger_spearman":float(rho3),"crc3_vs_sanger_spearman_p":float(p3),
+                            "crc3_vs_sanger_pearson":float(r3),"crc3_vs_sanger_pearson_p":float(pr3),
+                            "crc2_vs_sanger_spearman":float(rho2),"crc2_vs_sanger_spearman_p":float(p2)},
+            "thresholds":{}
+          }
+
+          for q in [0.05,0.10,0.20]:
+              z=d.copy()
+              z["b3"]=z.BroadCRC3D<=z.BroadCRC3D.quantile(q)
+              z["s3"]=z.SangerCRC3D<=z.SangerCRC3D.quantile(q)
+              z["b2"]=z.BroadCRC2D<=z.BroadCRC2D.quantile(q)
+              z["class"]=np.select(
+                  [z.b2&z.b3&z.s3, ~z.b2&z.b3&z.s3, z.b2&~z.b3&~z.s3],
+                  ["UNIVERSAL_2D_BOTH3D","THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY"],default="OTHER")
+              # enrichment of Broad CRC3D vs Sanger CRC3D extreme sets
+              a=int((z.b3&z.s3).sum()); b=int(z.b3.sum()-a); c=int(z.s3.sum()-a); dd=int(len(z)-a-b-c)
+              ov_or,ov_p=fisher_exact([[a,b],[c,dd]],alternative="greater")
+
+              study=z[z["class"].isin(["UNIVERSAL_2D_BOTH3D","THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY"])].copy()
+              study=study.merge(mx,left_on="gene",right_on="approvedSymbol",how="left").drop(columns=["approvedSymbol"],errors="ignore")
+              study=study.merge(esym,left_on="gene",right_on="approvedSymbol",how="left").drop(columns=["approvedSymbol"],errors="ignore")
+              study["max_stage"]=study.max_stage.fillna(0.0)
+              study["isEssential"]=study.isEssential.fillna(False).astype(bool)
+              for ep,t in [("phase2plus",2.0),("phase3plus",3.0),("approval",4.0)]:
+                  study[ep]=study.max_stage>=t
+
+              out={"class_counts":study["class"].value_counts().to_dict(),
+                   "overlap_3d_n":a,"overlap_3d_OR":float(ov_or),"overlap_3d_p":float(ov_p),
+                   "broad3d_n":int(z.b3.sum()),"sanger3d_n":int(z.s3.sum()),
+                   "essentiality":study.groupby("class").isEssential.agg(["sum","count","mean"]).to_dict("index"),
+                   "clinical_unadjusted":[],"glm":{}}
+              def cmp(a_name,b_name,ep):
+                  A=study[study["class"].eq(a_name)]; B=study[study["class"].eq(b_name)]
+                  ae=int(A[ep].sum()); be=int(B[ep].sum())
+                  OR,p=fisher_exact([[ae,len(A)-ae],[be,len(B)-be]],alternative="two-sided")
+                  return {"a":a_name,"b":b_name,"endpoint":ep,
+                          "a_n":len(A),"a_event":ae,"a_rate":ae/len(A) if len(A) else None,
+                          "b_n":len(B),"b_event":be,"b_rate":be/len(B) if len(B) else None,
+                          "OR":float(OR),"p":float(p)}
+              for ep in ["phase2plus","phase3plus","approval"]:
+                  out["clinical_unadjusted"].append(cmp("UNIVERSAL_2D_BOTH3D","TWO_D_ONLY",ep))
+                  out["clinical_unadjusted"].append(cmp("THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY",ep))
+
+              uv=study[study["class"].isin(["UNIVERSAL_2D_BOTH3D","TWO_D_ONLY"])].copy()
+              if len(uv):
+                  uv["replicated3d"]=uv["class"].eq("UNIVERSAL_2D_BOTH3D").astype(int)
+                  uv["essential_int"]=uv.isEssential.astype(int)
+                  uv["b2_z"]=(uv.BroadCRC2D-uv.BroadCRC2D.mean())/(uv.BroadCRC2D.std(ddof=0) or 1)
+                  for ep in ["phase2plus","phase3plus","approval"]:
+                      try:
+                          mod=glm(f"{ep} ~ replicated3d + b2_z + essential_int",
+                                  data=uv,family=sm.families.Binomial()).fit()
+                          bb=float(mod.params["replicated3d"]); se=float(mod.bse["replicated3d"])
+                          out["glm"][ep]={
+                              "n":int(len(uv)),"OR_replicated3d":float(np.exp(bb)),
+                              "CI95":[float(np.exp(bb-1.96*se)),float(np.exp(bb+1.96*se))],
+                              "p":float(mod.pvalues["replicated3d"]),
+                              "p_2D_strength":float(mod.pvalues.get("b2_z",np.nan)),
+                              "p_essentiality":float(mod.pvalues.get("essential_int",np.nan))}
+                      except Exception as e: out["glm"][ep]={"error":repr(e)}
+                  aa=uv[uv["class"].eq("UNIVERSAL_2D_BOTH3D")].BroadCRC2D
+                  bb2=uv[uv["class"].eq("TWO_D_ONLY")].BroadCRC2D
+                  if len(aa) and len(bb2):
+                      U,pu=mannwhitneyu(aa,bb2,alternative="two-sided")
+                      out["broad2d_strength"]={"universal_mean":float(aa.mean()),"twoDonly_mean":float(bb2.mean()),
+                                               "mw_p":float(pu)}
+              results["thresholds"][str(q)]=out
+
+          print("=== O01_CRC_LINEAGE_MATCHED_RESULT ===")
+          print(json.dumps(results,indent=2,default=str))
+          PY
+          python /tmp/o01_crc.py
