@@ -178,6 +178,60 @@ jobs:
                   "strata_used":len(tabs)
               }
 
+          # Continuous-effect confirmation: does 3D replication add information after
+          # controlling for the original Broad 2D dependency magnitude?
+          import statsmodels.api as sm
+          from statsmodels.formula.api import glm
+          from scipy.stats import mannwhitneyu
+          results["effect_strength"]={}
+          for cl in ["UNIVERSAL_2D_BOTH3D","TWO_D_ONLY"]:
+              z=g[g.subclass.eq(cl)].AdherentMean
+              results["effect_strength"][cl]={
+                  "mean":float(z.mean()),"median":float(z.median()),
+                  "q25":float(z.quantile(.25)),"q75":float(z.quantile(.75))}
+          aa=g[g.subclass.eq("UNIVERSAL_2D_BOTH3D")].AdherentMean
+          bb=g[g.subclass.eq("TWO_D_ONLY")].AdherentMean
+          U,pu=mannwhitneyu(aa,bb,alternative="two-sided")
+          results["effect_strength"]["mw_u"]=float(U)
+          results["effect_strength"]["mw_p"]=float(pu)
+
+          results["glm_adjustment"]={}
+          uv=g[g.subclass.isin(["UNIVERSAL_2D_BOTH3D","TWO_D_ONLY"])].copy()
+          uv["replicated3d"]=uv.subclass.eq("UNIVERSAL_2D_BOTH3D").astype(int)
+          uv["essential_int"]=uv.isEssential.astype(int)
+          uv["adherent_z"]=(uv.AdherentMean-uv.AdherentMean.mean())/uv.AdherentMean.std(ddof=0)
+          for ep in ["phase2plus","phase3plus","approval"]:
+              # all genes: adjust continuous 2D effect + OT essentiality
+              try:
+                  mod=glm(f"{ep} ~ replicated3d + adherent_z + essential_int",
+                          data=uv,family=sm.families.Binomial()).fit()
+                  b=float(mod.params["replicated3d"]); se=float(mod.bse["replicated3d"])
+                  results["glm_adjustment"][ep+"_all"]={
+                      "OR_replicated3d":float(np.exp(b)),
+                      "CI95":[float(np.exp(b-1.96*se)),float(np.exp(b+1.96*se))],
+                      "p":float(mod.pvalues["replicated3d"]),
+                      "beta_2D_strength":float(mod.params["adherent_z"]),
+                      "p_2D_strength":float(mod.pvalues["adherent_z"]),
+                      "beta_essentiality":float(mod.params["essential_int"]),
+                      "p_essentiality":float(mod.pvalues["essential_int"])}
+              except Exception as e:
+                  results["glm_adjustment"][ep+"_all"]={"error":repr(e)}
+              # nonessential only: removes the essentiality separation entirely
+              ne=uv[~uv.isEssential].copy()
+              try:
+                  mod=glm(f"{ep} ~ replicated3d + adherent_z",
+                          data=ne,family=sm.families.Binomial()).fit()
+                  b=float(mod.params["replicated3d"]); se=float(mod.bse["replicated3d"])
+                  results["glm_adjustment"][ep+"_nonessential"]={
+                      "n":int(len(ne)),
+                      "OR_replicated3d":float(np.exp(b)),
+                      "CI95":[float(np.exp(b-1.96*se)),float(np.exp(b+1.96*se))],
+                      "p":float(mod.pvalues["replicated3d"]),
+                      "beta_2D_strength":float(mod.params["adherent_z"]),
+                      "p_2D_strength":float(mod.pvalues["adherent_z"])}
+              except Exception as e:
+                  results["glm_adjustment"][ep+"_nonessential"]={"error":repr(e)}
+
           print("=== O01_ADJUSTED_RESULT ===")
           print(json.dumps(results,indent=2,default=str))
           PY
