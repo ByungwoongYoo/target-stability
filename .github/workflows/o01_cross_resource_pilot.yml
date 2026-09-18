@@ -1,0 +1,134 @@
+name: O01 cross-resource pilot
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl scipy
+      - name: Compute Broad-Sanger cross-resource pilot
+        shell: bash
+        run: |
+          cat > /tmp/o01_cross.py <<'PY'
+          import io, zipfile, json
+          import requests, pandas as pd, numpy as np
+          from scipy.stats import spearmanr, pearsonr, fisher_exact
+          UA={"User-Agent":"o01-cross-resource/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          def get(url):
+              r=requests.get(url,headers=UA,timeout=180)
+              r.raise_for_status(); return r.content
+
+          # Broad source data Fig 5b
+          burl=("https://media.springernature.com/original/springer-static/esm/"
+                "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM12_ESM.xlsx")
+          bb=get(burl)
+          broad=pd.read_excel(io.BytesIO(bb),sheet_name="Fig5b diff deps volcano")
+          broad=broad[["GeneSymbol","OrganoidsMean","OrganoidsN","AdherentMean","AdherentN",
+                       "MeanDifference","MannWhitneyPValue","MannWhitneyFDR","Cluster"]].copy()
+          broad["gene"]=broad["GeneSymbol"].astype(str).str.strip()
+          broad=broad.dropna(subset=["gene","OrganoidsMean","AdherentMean"]).drop_duplicates("gene")
+
+          # Sanger supplementary archive
+          surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
+                "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
+          z=zipfile.ZipFile(io.BytesIO(get(surl)))
+          meta=pd.read_excel(io.BytesIO(z.read("supplementary_table_2_revision.xlsx")),sheet_name="data_availability")
+          t5=pd.read_csv(io.BytesIO(z.read("supplementary_table_5_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","is_depleted"])
+          t6=pd.read_csv(io.BytesIO(z.read("supplementary_table_6_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","LFC"])
+          meta["sample_ID"]=meta["sample_ID"].astype(str)
+          screened=meta[meta["CRISPR_available"].astype(str).str.lower().eq("yes")].copy()
+          def yes(s): return s.astype(str).str.lower().isin(["yes","true","1"])
+          overlap=yes(screened["overlap_Broad_DepMap"])
+          crc=screened["primary_tumour_type"].astype(str).str.lower().eq("colorectal")
+          counts={
+              "sanger_screened":int(len(screened)),
+              "sanger_overlap_broad":int(overlap.sum()),
+              "sanger_nonoverlap_broad":int((~overlap).sum()),
+              "sanger_crc":int(crc.sum()),
+              "sanger_crc_overlap_broad":int((crc & overlap).sum()),
+              "sanger_crc_nonoverlap_broad":int((crc & ~overlap).sum()),
+          }
+
+          x=t6.merge(t5,on=["sample_ID","gene","library"],how="inner",validate="one_to_one")
+          # collapse double-screen libraries at model grain
+          pm=x.groupby(["sample_ID","gene"],as_index=False).agg(LFC=("LFC","mean"),is_depleted=("is_depleted","max"))
+          pm=pm.merge(screened[["sample_ID","primary_tumour_type","overlap_Broad_DepMap"]],on="sample_ID",how="inner",validate="many_to_one")
+
+          def gene_summary(df):
+              return df.groupby("gene",as_index=False).agg(
+                  sanger_n=("sample_ID","nunique"),
+                  sanger_mean_LFC=("LFC","mean"),
+                  sanger_median_LFC=("LFC","median"),
+                  sanger_frac_depleted=("is_depleted","mean"),
+              )
+          sg_all=gene_summary(pm)
+          sg_ind=gene_summary(pm[~yes(pm["overlap_Broad_DepMap"])])
+          sg_crc=gene_summary(pm[pm["primary_tumour_type"].astype(str).str.lower().eq("colorectal")])
+          sg_crc_ind=gene_summary(pm[
+              pm["primary_tumour_type"].astype(str).str.lower().eq("colorectal") &
+              ~yes(pm["overlap_Broad_DepMap"])
+          ])
+
+          def compare(sg,label):
+              d=broad.merge(sg,on="gene",how="inner").dropna(subset=["OrganoidsMean","AdherentMean","sanger_mean_LFC"]).copy()
+              rho,p=spearmanr(d["OrganoidsMean"],d["sanger_mean_LFC"])
+              pr,pp=pearsonr(d["OrganoidsMean"],d["sanger_mean_LFC"])
+              out={"label":label,"shared_genes":int(len(d)),"spearman_rho":float(rho),"spearman_p":float(p),
+                   "pearson_r":float(pr),"pearson_p":float(pp)}
+              sens={}
+              for q in [0.05,0.10,0.20]:
+                  bcut=d["OrganoidsMean"].quantile(q)
+                  scut=d["sanger_mean_LFC"].quantile(q)
+                  d["b3"]=d["OrganoidsMean"]<=bcut
+                  d["s3"]=d["sanger_mean_LFC"]<=scut
+                  k=int((d.b3 & d.s3).sum())
+                  a=k; b=int(d.b3.sum()-k); c=int(d.s3.sum()-k); dd=int(len(d)-a-b-c)
+                  OR,fp=fisher_exact([[a,b],[c,dd]],alternative="greater")
+                  # 2D-only / consensus / universal at same quantile
+                  d["b2"]=d["AdherentMean"]<=d["AdherentMean"].quantile(q)
+                  two3=int((d.b3 & d.s3).sum())
+                  twoDonly=int((d.b2 & ~d.b3 & ~d.s3).sum())
+                  universal=int((d.b2 & d.b3 & d.s3).sum())
+                  one3=int((d.b3 ^ d.s3).sum())
+                  sens[str(q)]={"broad3d_n":int(d.b3.sum()),"sanger3d_n":int(d.s3.sum()),"overlap_n":k,
+                                "overlap_OR":float(OR),"fisher_p":float(fp),
+                                "two3_consensus":two3,"twoD_only":twoDonly,
+                                "universal":universal,"one3_supported":one3,
+                                "broad3d_cut":float(bcut),"sanger3d_cut":float(scut)}
+              out["sensitivity"]=sens
+              # freeze 10% class and produce top examples
+              q=.10
+              d["b3"]=d["OrganoidsMean"]<=d["OrganoidsMean"].quantile(q)
+              d["s3"]=d["sanger_mean_LFC"]<=d["sanger_mean_LFC"].quantile(q)
+              d["b2"]=d["AdherentMean"]<=d["AdherentMean"].quantile(q)
+              consensus=d[d.b3 & d.s3].sort_values(["OrganoidsMean","sanger_mean_LFC"])
+              only2=d[d.b2 & ~d.b3 & ~d.s3].sort_values("AdherentMean")
+              out["top_consensus"]=consensus[["gene","OrganoidsMean","AdherentMean","sanger_mean_LFC","sanger_frac_depleted","Cluster"]].head(25).to_dict("records")
+              out["top_2d_only"]=only2[["gene","OrganoidsMean","AdherentMean","sanger_mean_LFC","sanger_frac_depleted","Cluster"]].head(25).to_dict("records")
+              return out,d
+
+          results={"counts":counts,
+                   "broad_genes":int(len(broad)),
+                   "sanger_gene_universe":int(pm["gene"].nunique()),
+                   "comparisons":[]}
+          frames={}
+          for sg,label in [(sg_all,"Sanger all 162"),(sg_ind,"Sanger Broad-nonoverlap only"),
+                           (sg_crc,"Sanger CRC 85"),(sg_crc_ind,"Sanger CRC Broad-nonoverlap only")]:
+              o,d=compare(sg,label); results["comparisons"].append(o); frames[label]=d
+
+          print("=== O01_CROSS_RESOURCE_RESULT ===")
+          print(json.dumps(results,indent=2,default=str))
+          PY
+          python /tmp/o01_cross.py
