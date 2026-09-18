@@ -1,0 +1,248 @@
+name: O01 translational enrichment
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  translational:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests pandas openpyxl scipy pyarrow
+      - name: Run translational enrichment
+        shell: bash
+        run: |
+          mkdir -p o01_translation
+          cat > /tmp/o01_translation.py <<'PY'
+          import io, os, re, json, math, zipfile, urllib.parse, xml.etree.ElementTree as ET
+          from pathlib import Path
+          import requests, pandas as pd, numpy as np, pyarrow.parquet as pq
+          from scipy.stats import fisher_exact
+          from scipy.optimize import minimize
+          
+          OUT=Path("o01_translation"); OUT.mkdir(exist_ok=True)
+          UA={"User-Agent":"o01-translation/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          def get(url, **kw):
+              h=UA.copy(); h.update(kw.pop("headers",{}))
+              r=requests.get(url,headers=h,timeout=240,**kw); r.raise_for_status(); return r
+          
+          # ---------- 1) Rebuild frozen Broad/Sanger 10% gene classes ----------
+          burl=("https://media.springernature.com/original/springer-static/esm/"
+                "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM12_ESM.xlsx")
+          broad=pd.read_excel(io.BytesIO(get(burl).content),sheet_name="Fig5b diff deps volcano")
+          broad=broad[["GeneSymbol","OrganoidsMean","AdherentMean","Cluster"]].copy()
+          broad["gene"]=broad["GeneSymbol"].astype(str).str.strip()
+          broad=broad.dropna(subset=["gene","OrganoidsMean","AdherentMean"]).drop_duplicates("gene")
+          
+          surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
+                "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
+          z=zipfile.ZipFile(io.BytesIO(get(surl).content))
+          meta=pd.read_excel(io.BytesIO(z.read("supplementary_table_2_revision.xlsx")),sheet_name="data_availability")
+          t6=pd.read_csv(io.BytesIO(z.read("supplementary_table_6_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","LFC"])
+          meta["sample_ID"]=meta["sample_ID"].astype(str)
+          screened=meta[meta["CRISPR_available"].astype(str).str.lower().eq("yes")].copy()
+          t6["sample_ID"]=t6["sample_ID"].astype(str)
+          pm=t6.groupby(["sample_ID","gene"],as_index=False).agg(LFC=("LFC","mean"))
+          pm=pm.merge(screened[["sample_ID","overlap_Broad_DepMap"]],on="sample_ID",how="inner",validate="many_to_one")
+          yes=pm["overlap_Broad_DepMap"].astype(str).str.lower().isin(["yes","true","1"])
+          sg=(pm[~yes].groupby("gene",as_index=False)
+              .agg(sanger_mean_LFC=("LFC","mean"),sanger_n=("sample_ID","nunique")))
+          d=broad.merge(sg,on="gene",how="inner").dropna().copy()
+          q=.10
+          b3cut=d["OrganoidsMean"].quantile(q); s3cut=d["sanger_mean_LFC"].quantile(q); b2cut=d["AdherentMean"].quantile(q)
+          d["broad3d"]=d["OrganoidsMean"]<=b3cut
+          d["sanger3d"]=d["sanger_mean_LFC"]<=s3cut
+          d["broad2d"]=d["AdherentMean"]<=b2cut
+          d["class"]=np.select(
+              [d["broad3d"] & d["sanger3d"], d["broad2d"] & ~d["broad3d"] & ~d["sanger3d"]],
+              ["TWO_3D_CONSENSUS","TWO_D_ONLY"], default="OTHER")
+          study=d[d["class"].isin(["TWO_3D_CONSENSUS","TWO_D_ONLY"])].copy()
+          study.to_csv(OUT/"gene_classes.csv",index=False)
+          
+          # ---------- 2) Open Targets 26.06 public S3 discovery ----------
+          S3ROOT="https://open-targets-public-data-releases.s3.amazonaws.com/"
+          NS={"s3":"http://s3.amazonaws.com/doc/2006-03-01/"}
+          def list_prefixes(prefix):
+              token=None; prefixes=[]; keys=[]
+              while True:
+                  params={"list-type":"2","prefix":prefix,"delimiter":"/","max-keys":"1000"}
+                  if token: params["continuation-token"]=token
+                  r=get(S3ROOT,params=params)
+                  root=ET.fromstring(r.content)
+                  prefixes += [x.text for x in root.findall("s3:CommonPrefixes/s3:Prefix",NS)]
+                  keys += [x.find("s3:Key",NS).text for x in root.findall("s3:Contents",NS)]
+                  trunc=(root.findtext("s3:IsTruncated",default="false",namespaces=NS)=="true")
+                  token=root.findtext("s3:NextContinuationToken",default=None,namespaces=NS)
+                  if not trunc: break
+              return prefixes,keys
+          def list_keys(prefix):
+              token=None; keys=[]
+              while True:
+                  params={"list-type":"2","prefix":prefix,"max-keys":"1000"}
+                  if token: params["continuation-token"]=token
+                  r=get(S3ROOT,params=params)
+                  root=ET.fromstring(r.content)
+                  keys += [x.find("s3:Key",NS).text for x in root.findall("s3:Contents",NS)]
+                  trunc=(root.findtext("s3:IsTruncated",default="false",namespaces=NS)=="true")
+                  token=root.findtext("s3:NextContinuationToken",default=None,namespaces=NS)
+                  if not trunc: break
+              return keys
+          top_prefixes,_=list_prefixes("platform/26.06/output/")
+          names=[p.rstrip("/").split("/")[-1] for p in top_prefixes]
+          print("OT26.06_DATASETS",names)
+          target_name="target" if "target" in names else next((n for n in names if n.startswith("target")),None)
+          kd_candidates=[n for n in names if ("known" in n.lower() and "drug" in n.lower())]
+          if not kd_candidates:
+              kd_candidates=[n for n in names if "drug" in n.lower()]
+          print("TARGET_DATASET",target_name,"DRUG_CANDIDATES",kd_candidates)
+          if not target_name:
+              raise RuntimeError("Open Targets target dataset not found")
+          
+          def read_parquet_dataset(dsname, wanted=None):
+              prefix=f"platform/26.06/output/{dsname}/"
+              keys=[k for k in list_keys(prefix) if k.endswith(".parquet")]
+              if not keys: raise RuntimeError(f"No parquet files under {prefix}")
+              frames=[]; schema_names=None
+              for i,k in enumerate(keys):
+                  url=S3ROOT+urllib.parse.quote(k,safe="/")
+                  b=get(url).content
+                  table=pq.read_table(io.BytesIO(b))
+                  if schema_names is None: schema_names=table.schema.names
+                  cols=[c for c in (wanted or table.schema.names) if c in table.schema.names]
+                  frames.append(table.select(cols).to_pandas())
+              return pd.concat(frames,ignore_index=True), schema_names, keys
+          
+          targets,target_schema,target_keys=read_parquet_dataset(target_name,["id","approvedSymbol","tractability"])
+          print("TARGET_SCHEMA",target_schema)
+          targets=targets.drop_duplicates("id")
+          
+          # Find a dataset carrying targetId + clinical phase.
+          kd=None; kd_name=None; kd_schema=None; kd_keys=None
+          try_names=kd_candidates + [n for n in names if n not in kd_candidates and ("evidence" in n.lower())]
+          seen=set()
+          for n in try_names:
+              if n in seen: continue
+              seen.add(n)
+              try:
+                  prefix=f"platform/26.06/output/{n}/"
+                  keys=[k for k in list_keys(prefix) if k.endswith(".parquet")]
+                  if not keys: continue
+                  # inspect first parquet only
+                  b=get(S3ROOT+urllib.parse.quote(keys[0],safe="/")).content
+                  tab=pq.read_table(io.BytesIO(b))
+                  sch=tab.schema.names
+                  has_target=any(c in sch for c in ["targetId","target_id","target"])
+                  has_phase=any(c in sch for c in ["phase","clinicalPhase","maxPhaseForIndication","maximumClinicalTrialPhase","maxPhase"])
+                  print("CANDIDATE",n,sch[:80],"HAS",has_target,has_phase)
+                  if has_target and has_phase:
+                      wanted=[c for c in ["targetId","target_id","target","drugId","drug_id","phase","clinicalPhase","maxPhaseForIndication","maximumClinicalTrialPhase","maxPhase","status","diseaseId","disease_id"] if c in sch]
+                      frames=[]
+                      for k in keys:
+                          bb=get(S3ROOT+urllib.parse.quote(k,safe="/")).content
+                          tt=pq.read_table(io.BytesIO(bb))
+                          cols=[c for c in wanted if c in tt.schema.names]
+                          frames.append(tt.select(cols).to_pandas())
+                      kd=pd.concat(frames,ignore_index=True); kd_name=n; kd_schema=sch; kd_keys=keys; break
+              except Exception as e:
+                  print("CANDIDATE_FAIL",n,repr(e))
+          
+          if kd is None:
+              # Fallback: query Open Targets GraphQL target knownDrugs one-by-one after mapping symbols by search.
+              print("NO_BULK_KNOWN_DRUG_DATASET; USING_GRAPHQL_FALLBACK")
+              GQL="https://api.platform.opentargets.org/api/v4/graphql"
+              q_search='''query Search($q:String!){search(queryString:$q,entityNames:["target"],page:{index:0,size:5}){hits{id name entity}}}'''
+              q_target='''query Target($id:String!){target(ensemblId:$id){id approvedSymbol knownDrugs{rows{phase status drug{id name isApproved}}}}}'''
+              rows=[]
+              sess=requests.Session(); sess.headers.update(UA)
+              for j,g in enumerate(study["gene"].tolist()):
+                  sr=sess.post(GQL,json={"query":q_search,"variables":{"q":g}},timeout=120); sr.raise_for_status()
+                  hits=((sr.json().get("data") or {}).get("search") or {}).get("hits") or []
+                  tid=None
+                  for h in hits:
+                      if str(h.get("name","")).upper()==g.upper() or str(h.get("id","")).startswith("ENSG"):
+                          tid=h.get("id"); break
+                  if not tid: continue
+                  rr=sess.post(GQL,json={"query":q_target,"variables":{"id":tid}},timeout=120); rr.raise_for_status()
+                  tj=(rr.json().get("data") or {}).get("target") or {}
+                  for z in ((tj.get("knownDrugs") or {}).get("rows") or []):
+                      rows.append({"targetId":tid,"phase":z.get("phase"),"status":z.get("status"),
+                                   "drugId":(z.get("drug") or {}).get("id"),
+                                   "isApproved":(z.get("drug") or {}).get("isApproved")})
+                  if (j+1)%100==0: print("GQL_PROGRESS",j+1)
+              kd=pd.DataFrame(rows); kd_name="GraphQL_knownDrugs"; kd_schema=list(kd.columns); kd_keys=[]
+          
+          # ---------- 3) Harmonise and compute target-level max phase ----------
+          tcol=next(c for c in ["targetId","target_id","target"] if c in kd.columns)
+          pcol=next(c for c in ["phase","clinicalPhase","maxPhaseForIndication","maximumClinicalTrialPhase","maxPhase"] if c in kd.columns)
+          kd[pcol]=pd.to_numeric(kd[pcol],errors="coerce")
+          phase=kd.dropna(subset=[tcol,pcol]).groupby(tcol,as_index=False)[pcol].max().rename(columns={tcol:"id",pcol:"max_phase"})
+          annot=targets.merge(phase,on="id",how="left")
+          gene_annot=study.merge(annot[["id","approvedSymbol","max_phase"]],left_on="gene",right_on="approvedSymbol",how="left")
+          gene_annot["max_phase"]=gene_annot["max_phase"].fillna(0.0)
+          gene_annot["clinical_any"]=gene_annot["max_phase"]>0
+          gene_annot["phase2plus"]=gene_annot["max_phase"]>=2
+          gene_annot["phase3plus"]=gene_annot["max_phase"]>=3
+          gene_annot["approved"]=gene_annot["max_phase"]>=4
+          gene_annot.to_csv(OUT/"clinical_evidence.csv",index=False)
+          
+          def fisher_for(endpoint):
+              a=gene_annot[gene_annot["class"]=="TWO_3D_CONSENSUS"]
+              b=gene_annot[gene_annot["class"]=="TWO_D_ONLY"]
+              aa=int(a[endpoint].sum()); ab=int(len(a)-aa); ba=int(b[endpoint].sum()); bb=int(len(b)-ba)
+              OR,p=fisher_exact([[aa,ab],[ba,bb]],alternative="two-sided")
+              return {"endpoint":endpoint,
+                      "consensus_n":int(len(a)),"consensus_event":aa,"consensus_rate":aa/len(a),
+                      "twoD_n":int(len(b)),"twoD_event":ba,"twoD_rate":ba/len(b),
+                      "odds_ratio":float(OR),"fisher_p":float(p)}
+          enrich=[fisher_for(e) for e in ["clinical_any","phase2plus","phase3plus","approved"]]
+          
+          # Directional trend: ordinal max phase distribution and mean
+          dist=(gene_annot.groupby(["class","max_phase"]).size().reset_index(name="n"))
+          dist.to_csv(OUT/"phase_distribution.csv",index=False)
+          
+          # Top 3D consensus genes with highest clinical phase, then strongest Broad 3D effect
+          top=(gene_annot[gene_annot["class"]=="TWO_3D_CONSENSUS"]
+               .sort_values(["max_phase","OrganoidsMean","sanger_mean_LFC"],ascending=[False,True,True])
+               [["gene","max_phase","OrganoidsMean","AdherentMean","sanger_mean_LFC","Cluster"]].head(50))
+          top.to_csv(OUT/"top_consensus_clinical.csv",index=False)
+          
+          result={
+            "release":"Open Targets Platform 26.06",
+            "ot_dataset":kd_name,
+            "ot_dataset_schema":kd_schema,
+            "shared_gene_universe":int(len(d)),
+            "class_counts":gene_annot["class"].value_counts().to_dict(),
+            "mapped_to_ot_target":int(gene_annot["id"].notna().sum()),
+            "unmapped_to_ot_target":int(gene_annot["id"].isna().sum()),
+            "thresholds":{"quantile":0.10,"broad3d_cut":float(b3cut),"sanger3d_cut":float(s3cut),"broad2d_cut":float(b2cut)},
+            "enrichment":enrich,
+            "mean_max_phase":gene_annot.groupby("class")["max_phase"].mean().to_dict(),
+            "median_max_phase":gene_annot.groupby("class")["max_phase"].median().to_dict(),
+            "top_consensus_clinical":top.to_dict("records"),
+            "notes":[
+              "Broad Figure 5b source-data table is the same filtered gene universe used in the prior O01 pilot.",
+              "Sanger models explicitly marked as overlapping Broad are excluded.",
+              "Clinical phase is target-level maximum phase, independent of indication, matching the Open Targets target-prioritisation concept.",
+              "This is a target-level translational enrichment test, not yet cancer-indication-specific clinical efficacy."
+            ]
+          }
+          (OUT/"result.json").write_text(json.dumps(result,indent=2,default=str))
+          print("=== O01_TRANSLATIONAL_RESULT ===")
+          print(json.dumps(result,indent=2,default=str))
+          PY
+          python /tmp/o01_translation.py
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: o01-translation
+          path: o01_translation/
+          if-no-files-found: error
+          retention-days: 7
