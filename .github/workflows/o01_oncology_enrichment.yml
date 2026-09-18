@@ -145,25 +145,30 @@ jobs:
           # 5) Target symbol mapping.
           targets,target_schema,_=read_dataset("target",["id","approvedSymbol"])
           targets=targets.drop_duplicates("id")
+          # Map clinical target IDs to symbols FIRST, then collapse to gene-symbol grain.
+          # This avoids denominator inflation when more than one Ensembl target ID shares an approved symbol.
+          ev_sym=ev.merge(targets,left_on="targetId",right_on="id",how="left",validate="many_to_one")
+          duplicate_symbols=(targets.groupby("approvedSymbol")["id"].nunique().sort_values(ascending=False))
+          duplicate_symbols=duplicate_symbols[duplicate_symbols>1]
+          print("DUPLICATE_APPROVED_SYMBOLS",duplicate_symbols.head(20).to_dict())
 
           def summarize(q):
               cls,cuts=classes_at(q)
               study=cls[cls["class"].isin(["TWO_3D_CONSENSUS","TWO_D_ONLY"])].copy()
-              study=study.merge(targets,left_on="gene",right_on="approvedSymbol",how="left")
-              # all oncology evidence
-              mx=ev.groupby("targetId",as_index=False).agg(
+              # all oncology evidence, collapsed to approved gene symbol
+              mx=ev_sym.dropna(subset=["approvedSymbol"]).groupby("approvedSymbol",as_index=False).agg(
                   max_oncology_stage=("stage_num","max"),
                   oncology_evidence_rows=("stage_num","size"),
                   oncology_drug_n=("drugId","nunique"),
                   oncology_approval_history=("approval_history","max"))
-              # single-target mechanism sensitivity
-              se=ev[ev["drug_target_count"].eq(1)].copy()
-              smx=se.groupby("targetId",as_index=False).agg(
+              # single-target mechanism sensitivity, also gene-symbol grain
+              se=ev_sym[ev_sym["drug_target_count"].eq(1)].dropna(subset=["approvedSymbol"]).copy()
+              smx=se.groupby("approvedSymbol",as_index=False).agg(
                   max_oncology_stage_single=("stage_num","max"),
                   oncology_single_drug_n=("drugId","nunique"),
                   oncology_approval_single=("approval_history","max"))
-              g=study.merge(mx,left_on="id",right_on="targetId",how="left").drop(columns=["targetId"],errors="ignore")
-              g=g.merge(smx,left_on="id",right_on="targetId",how="left").drop(columns=["targetId"],errors="ignore")
+              g=study.merge(mx,left_on="gene",right_on="approvedSymbol",how="left").drop(columns=["approvedSymbol"],errors="ignore")
+              g=g.merge(smx,left_on="gene",right_on="approvedSymbol",how="left").drop(columns=["approvedSymbol"],errors="ignore")
               for c in ["max_oncology_stage","max_oncology_stage_single"]:
                   g[c]=g[c].fillna(0.0)
               for c in ["oncology_evidence_rows","oncology_drug_n","oncology_single_drug_n"]:
@@ -199,7 +204,7 @@ jobs:
               out={
                   "q":q,"cuts":cuts,
                   "class_counts":g["class"].value_counts().to_dict(),
-                  "mapped_targets":int(g["id"].notna().sum()),
+                  "mapped_targets":int(g["oncology_evidence_rows"].gt(0).sum()),
                   "enrichment":result,
                   "mean_max_oncology_stage":g.groupby("class")["max_oncology_stage"].mean().to_dict(),
                   "mw_stage_u":float(u),"mw_stage_p":float(p)
@@ -227,6 +232,7 @@ jobs:
               "shared_gene_universe":int(len(d)),
               "frozen_q10_expected":{"TWO_3D_CONSENSUS":729,"TWO_D_ONLY":278},
               "frozen_q10_reproduced":allres[1]["class_counts"],
+              "duplicate_approved_symbols_n":int(len(duplicate_symbols)),
               "oncology_precedence_rows":int(len(ev)),
               "oncology_precedence_targets":int(ev["targetId"].nunique()),
               "oncology_precedence_drugs":int(ev["drugId"].nunique()),
