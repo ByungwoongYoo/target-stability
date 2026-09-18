@@ -1,0 +1,218 @@
+name: O01 execution scratch probe
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install analysis dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas openpyxl polars pyarrow scipy
+      - name: Run O01 data probe
+        shell: bash
+        run: |
+          mkdir -p o01_probe
+          cat > /tmp/o01_probe.py <<'PY'
+          import json, os, io, zipfile, hashlib, traceback
+          from pathlib import Path
+          import requests, pandas as pd
+
+          OUT=Path("o01_probe"); OUT.mkdir(exist_ok=True)
+          UA={"User-Agent":"o01-public-data-audit/0.1 (+https://github.com/ByungwoongYoo/target-stability)",
+              "Accept":"application/json"}
+          report={}
+
+          def get(url, **kw):
+              h=kw.pop("headers",{})
+              hh=UA.copy(); hh.update(h)
+              r=requests.get(url,headers=hh,timeout=120,**kw)
+              return r
+          def post(url, **kw):
+              h=kw.pop("headers",{})
+              hh=UA.copy(); hh.update(h)
+              r=requests.post(url,headers=hh,timeout=120,**kw)
+              return r
+          def sha256(path):
+              h=hashlib.sha256()
+              with open(path,"rb") as f:
+                  for b in iter(lambda:f.read(1<<20),b""): h.update(b)
+              return h.hexdigest()
+
+          # 1) Broad Breadbox
+          base="https://depmap.org/portal/breadbox"
+          dsid="fa1b635a-5116-4a93-b66d-84eca7e2a402"
+          broad={}
+          for ep in [f"datasets/{dsid}", "datasets/", f"datasets/features/{dsid}"]:
+              try:
+                  r=get(f"{base}/{ep}")
+                  broad[ep]={"status":r.status_code,"content_type":r.headers.get("content-type"),"bytes":len(r.content)}
+                  if r.ok:
+                      obj=r.json()
+                      if ep=="datasets/":
+                          hits=[x for x in obj if str(x.get("id"))==dsid or "NextGen" in str(x.get("name",""))]
+                          broad[ep]["nextgen_hits"]=hits
+                      elif ep.endswith(dsid) and "features" in ep:
+                          broad[ep]["n_features"]=len(obj) if isinstance(obj,list) else None
+                          broad[ep]["first3"]=obj[:3] if isinstance(obj,list) else obj
+                      else:
+                          broad[ep]["json"]=obj
+                  else: broad[ep]["text"]=r.text[:1000]
+              except Exception as e: broad[ep]={"error":repr(e)}
+          try:
+              r=post(f"{base}/datasets/matrix/{dsid}",json={"features":["KRAS","TP53","CDK4","MDM2"],"feature_identifier":"label"})
+              broad["matrix_probe"]={"status":r.status_code,"bytes":len(r.content),"content_type":r.headers.get("content-type")}
+              if r.ok:
+                  obj=r.json(); broad["matrix_probe"]["keys"]=list(obj)[:10]
+                  broad["matrix_probe"]["n_values"]={k:len(v) if isinstance(v,dict) else None for k,v in obj.items()}
+                  with open(OUT/"broad_matrix_probe.json","w") as f: json.dump(obj,f)
+              else: broad["matrix_probe"]["text"]=r.text[:2000]
+          except Exception as e: broad["matrix_probe"]={"error":repr(e)}
+          # tabular metadata candidates
+          for cols in [
+              ["CellLineName","OncotreeLineage","OncotreePrimaryDisease"],
+              ["ModelID","IsNextGen","CRISPRScreenType","OncotreeLineage"]
+          ]:
+              key="metadata_"+"_".join(cols[:2])
+              try:
+                  r=post(f"{base}/datasets/tabular/depmap_model_metadata",json={"columns":cols})
+                  broad[key]={"status":r.status_code,"bytes":len(r.content)}
+                  if r.ok:
+                      obj=r.json(); broad[key]["keys"]=list(obj)[:10]
+                      with open(OUT/f"{key}.json","w") as f: json.dump(obj,f)
+                  else:broad[key]["text"]=r.text[:1000]
+              except Exception as e:broad[key]={"error":repr(e)}
+          report["broad_breadbox"]=broad
+
+          # Broad source/supp files
+          broad_files={
+              "supp_table1":"https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM3_ESM.xlsx",
+              "source_fig5":"https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM12_ESM.xlsx",
+              "source_extfig8":"https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM19_ESM.xlsx",
+          }
+          report["broad_files"]={}
+          for name,url in broad_files.items():
+              try:
+                  r=get(url,headers={"Accept":"*/*"})
+                  p=OUT/f"{name}.xlsx"
+                  report["broad_files"][name]={"status":r.status_code,"bytes":len(r.content),"ctype":r.headers.get("content-type")}
+                  if r.ok and r.content[:2]==b"PK":
+                      p.write_bytes(r.content)
+                      report["broad_files"][name]["sha256"]=sha256(p)
+                      x=pd.ExcelFile(p)
+                      report["broad_files"][name]["sheets"]=x.sheet_names
+                      shapes={}
+                      for sh in x.sheet_names:
+                          try:
+                              df=pd.read_excel(p,sheet_name=sh)
+                              shapes[sh]={"rows":len(df),"cols":len(df.columns),"columns":[str(c) for c in df.columns[:30]]}
+                              # save first 20 lines for inspection
+                              df.head(20).to_csv(OUT/f"{name}__{sh[:40].replace('/','_')}.head.csv",index=False)
+                          except Exception as ex: shapes[sh]={"error":repr(ex)}
+                      report["broad_files"][name]["shapes"]=shapes
+                  else: report["broad_files"][name]["text"]=r.text[:500] if "text" in r.headers.get("content-type","") else repr(r.content[:100])
+              except Exception as e: report["broad_files"][name]={"error":repr(e)}
+
+          # 2) Sanger archive - download once and inspect
+          surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
+                "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
+          sanger={}
+          try:
+              r=get(surl,headers={"Accept":"*/*"})
+              sanger["download"]={"status":r.status_code,"bytes":len(r.content),"ctype":r.headers.get("content-type")}
+              if r.ok and r.content[:2]==b"PK":
+                  zp=OUT/"sanger_supp.zip"; zp.write_bytes(r.content)
+                  sanger["download"]["sha256"]=sha256(zp)
+                  z=zipfile.ZipFile(io.BytesIO(r.content))
+                  names=z.namelist(); sanger["members"]=names
+                  wanted=["supplementary_table_2_revision.xlsx","supplementary_table_5_revision.csv","supplementary_table_6_revision.csv"]
+                  for member in wanted:
+                      b=z.read(member)
+                      sanger[member]={"bytes":len(b)}
+                      if member.endswith(".xlsx"):
+                          xf=pd.ExcelFile(io.BytesIO(b))
+                          sanger[member]["sheets"]=xf.sheet_names
+                          if "data_availability" in xf.sheet_names:
+                              df=pd.read_excel(io.BytesIO(b),sheet_name="data_availability")
+                              sanger[member]["rows"]=len(df); sanger[member]["columns"]=[str(c) for c in df.columns]
+                              df.to_csv(OUT/"sanger_data_availability.csv",index=False)
+                              # counts
+                              if "CRISPR_available" in df.columns:
+                                  scr=df[df["CRISPR_available"].astype(str).str.lower().eq("yes")]
+                                  sanger["screened_models"]=int(len(scr))
+                                  if "primary_tumour_type" in scr.columns:
+                                      sanger["screened_by_tumour"]=scr["primary_tumour_type"].astype(str).value_counts(dropna=False).to_dict()
+                      else:
+                          # space-delimited
+                          df=pd.read_csv(io.BytesIO(b),sep=r"\s+",engine="python")
+                          sanger[member]["rows"]=len(df); sanger[member]["cols"]=len(df.columns); sanger[member]["columns"]=[str(c) for c in df.columns]
+                          # write small gene list / crc summaries after both tables handled separately below
+                          if member.endswith("table_5_revision.csv"):
+                              t5=df
+                          else:
+                              t6=df
+                  # combine and compute CRC summaries
+                  if "t5" in locals() and "t6" in locals():
+                      keys=["sample_ID","gene","library"]
+                      same=t5[keys].equals(t6[keys])
+                      sanger["t5_t6_key_order_equal"]=bool(same)
+                      meta=pd.read_csv(OUT/"sanger_data_availability.csv")
+                      crc_ids=set(meta.loc[(meta["CRISPR_available"].astype(str).str.lower()=="yes") &
+                                           meta["primary_tumour_type"].astype(str).str.contains("COAD|READ|colorectal",case=False,regex=True),"sample_ID"].astype(str))
+                      d=t6[["sample_ID","gene","library","LFC"]].copy()
+                      d["sample_ID"]=d["sample_ID"].astype(str)
+                      d=d[d["sample_ID"].isin(crc_ids)]
+                      b=t5[["sample_ID","gene","library","is_depleted"]].copy(); b["sample_ID"]=b["sample_ID"].astype(str)
+                      b=b[b["sample_ID"].isin(crc_ids)]
+                      # collapse libraries per model
+                      per=d.groupby(["sample_ID","gene"],as_index=False)["LFC"].mean()
+                      pb=b.groupby(["sample_ID","gene"],as_index=False)["is_depleted"].max()
+                      per=per.merge(pb,on=["sample_ID","gene"],how="inner")
+                      summary=per.groupby("gene").agg(n_models=("sample_ID","nunique"),mean_LFC=("LFC","mean"),median_LFC=("LFC","median"),frac_depleted=("is_depleted","mean")).reset_index()
+                      summary.to_csv(OUT/"sanger_crc_gene_summary.csv",index=False)
+                      sanger["crc_ids"]=len(crc_ids)
+                      sanger["crc_model_gene_rows"]=len(per)
+                      sanger["crc_genes"]=int(summary["gene"].nunique())
+                      sanger["crc_screened_models_in_matrix"]=int(per["sample_ID"].nunique())
+              else:sanger["text"]=r.text[:500] if "text" in r.headers.get("content-type","") else repr(r.content[:100])
+          except Exception as e:
+              sanger["error"]=repr(e); sanger["trace"]=traceback.format_exc()[-4000:]
+          report["sanger"]=sanger
+
+          # 3) Mendeley API probes
+          mend={}
+          urls=[
+              "https://api.mendeley.com/datasets/hr94h42xdc/versions/3",
+              "https://api.mendeley.com/datasets/hr94h42xdc?version=3",
+              "https://data.mendeley.com/public-files/datasets/hr94h42xdc/files"
+          ]
+          for url in urls:
+              try:
+                  r=get(url)
+                  mend[url]={"status":r.status_code,"bytes":len(r.content),"ctype":r.headers.get("content-type"),"text":r.text[:2000]}
+                  if r.ok and "json" in r.headers.get("content-type",""):
+                      obj=r.json(); mend[url]["json"]=obj
+                      with open(OUT/f"mendeley_{len(mend)}.json","w") as f: json.dump(obj,f)
+              except Exception as e:mend[url]={"error":repr(e)}
+          report["mendeley"]=mend
+
+          with open(OUT/"probe_report.json","w") as f: json.dump(report,f,indent=2,default=str)
+          print(json.dumps(report,indent=2,default=str)[:20000])
+          PY
+          python /tmp/o01_probe.py
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: o01-probe
+          path: o01_probe/
+          if-no-files-found: error
+          retention-days: 3
