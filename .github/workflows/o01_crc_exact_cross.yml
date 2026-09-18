@@ -25,7 +25,7 @@ jobs:
 
           BB="https://depmap.org/portal/breadbox"
           DSID="fa1b635a-5116-4a93-b66d-84eca7e2a402"
-          H={"User-Agent":"o01-crc-exact/0.1 (+https://github.com/ByungwoongYoo/target-stability)",
+          H={"User-Agent":"o01-crc-exact/0.2 (+https://github.com/ByungwoongYoo/target-stability)",
              "Accept":"application/json"}
 
           def req(method,url,**kw):
@@ -35,11 +35,15 @@ jobs:
                   try:
                       r=requests.request(method,url,headers=h,timeout=240,**kw)
                       if r.status_code < 500:
-                          r.raise_for_status(); return r
+                          if not r.ok:
+                              raise RuntimeError(f"HTTP {r.status_code}: {r.text[:1200]}")
+                          return r
                       err=RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-                  except Exception as e: err=e
+                  except Exception as e:
+                      err=e
                   time.sleep(2*(a+1))
               raise err
+
           def bget(ep): return req("GET",BB+"/"+ep.lstrip("/")).json()
           def bpost(ep,body): return req("POST",BB+"/"+ep.lstrip("/"),json=body).json()
           def get(url): return req("GET",url).content
@@ -55,9 +59,13 @@ jobs:
                       if isinstance(v,dict): row[k]=v.get(i)
                   rows.append(row)
               return pd.DataFrame(rows)
+
           def truth(s):
               return s.astype(str).str.lower().isin(["true","yes","1","y"])
 
+          # Exact screen definitions from Broad public analysis code:
+          # 3D = IsNextGen & ScreenType == 3DO
+          # 2D comparator = IsAdherent2D in the same lineage.
           cols=["ModelID","OncotreeLineage","IsNextGen","IsAdherent2D",
                 "IsTraditional2D","PassesQC","ScreenType","GrowthPattern","label"]
           md=frame(bpost("datasets/tabular/screen_nextgen_metadata",{"columns":cols}))
@@ -65,33 +73,44 @@ jobs:
           samples=bget(f"datasets/samples/{DSID}")
           matrix_ids=set(str(x["id"]) for x in samples)
           md=md[md.screen_id.isin(matrix_ids)].copy()
-          print("SCREEN_METADATA_ROWS_IN_MATRIX",len(md))
-          print("LINEAGE_COUNTS",md.OncotreeLineage.astype(str).value_counts(dropna=False).to_dict())
-          print("SCREEN_TYPE_COUNTS",md.ScreenType.astype(str).value_counts(dropna=False).to_dict())
-          print("GROWTH_PATTERN_COUNTS",md.GrowthPattern.astype(str).value_counts(dropna=False).to_dict())
 
           crc=md.OncotreeLineage.astype(str).str.lower().str.contains(r"colorectal|colon|rect|bowel",regex=True)
           broad3=md[crc & truth(md.IsNextGen) & md.ScreenType.astype(str).eq("3DO")].copy()
           broad2=md[crc & truth(md.IsAdherent2D)].copy()
+
+          print("SCREEN_METADATA_ROWS_IN_MATRIX",len(md))
           print("CRC_LINEAGES",md.loc[crc,"OncotreeLineage"].astype(str).value_counts().to_dict())
           print("BROAD_CRC_3D_SCREENS",len(broad3),"MODELS",broad3.ModelID.astype(str).nunique())
           print("BROAD_CRC_2D_SCREENS",len(broad2),"MODELS",broad2.ModelID.astype(str).nunique())
           if len(broad3)==0 or len(broad2)==0:
               raise RuntimeError("Broad CRC 3D/2D selection empty")
 
+          features=bget(f"datasets/features/{DSID}")
+          fmap={str(x["id"]):str(x["label"]) for x in features}
+          print("FEATURE_MAP_N",len(fmap))
+
           def aggregate(ids,name):
+              # When aggregating all features across a selected sample set,
+              # Breadbox expects only the sample selector plus aggregate.
               obj=bpost(f"datasets/matrix/{DSID}",{
-                  "sample_identifier":"id","samples":sorted(set(ids)),
-                  "feature_identifier":"label","features":None,
-                  "aggregate":{"aggregate_by":"samples","aggregation":["mean","count"]}})
+                  "sample_identifier":"id",
+                  "samples":sorted(set(ids)),
+                  "aggregate":{"aggregate_by":"samples","aggregation":["mean","count"]}
+              })
               mean=obj["mean"]; cnt=obj["count"]
-              print(name,"GENES",len(mean),"COUNT_RANGE",[min(cnt.values()),max(cnt.values())])
-              return pd.DataFrame({"gene":list(mean.keys()),name:[mean[k] for k in mean],
-                                   name+"_n":[cnt.get(k) for k in mean]})
+              rows=[]
+              for k,v in mean.items():
+                  gene=fmap.get(str(k),str(k))
+                  rows.append({"gene":gene,name:v,name+"_n":cnt.get(k)})
+              out=pd.DataFrame(rows)
+              print(name,"GENES",len(out),"COUNT_RANGE",
+                    [int(pd.to_numeric(out[name+"_n"]).min()),int(pd.to_numeric(out[name+"_n"]).max())])
+              return out
+
           b3=aggregate(broad3.screen_id.tolist(),"BroadCRC3D")
           b2=aggregate(broad2.screen_id.tolist(),"BroadCRC2D")
 
-          # Sanger CRC organoids, remove explicitly Broad-overlapping models
+          # Independent Sanger CRC organoids; explicitly remove models marked as Broad-overlapping.
           surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
                 "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
           z=zipfile.ZipFile(io.BytesIO(get(surl)))
@@ -99,14 +118,7 @@ jobs:
           t6=pd.read_csv(io.BytesIO(z.read("supplementary_table_6_revision.csv")),sep=r"\s+",engine="python",
                          usecols=["sample_ID","gene","library","LFC"])
           meta["sample_ID"]=meta.sample_ID.astype(str)
-          scr=meta[meta.CRIsPR_available.astype(str).str.lower().eq("yes")].copy() if "CRIsPR_available" in meta.columns else meta[meta.CRIsPR_available.astype(str).str.lower().eq("yes")]
-          PY
-          # Fix column case robustly and continue in a second heredoc transform
-          python - <<'PY'
-          p="/tmp/o01_crc_exact.py"
-          s=open(p).read()
-          s=s.replace('scr=meta[meta.CRIsPR_available.astype(str).str.lower().eq("yes")].copy() if "CRIsPR_available" in meta.columns else meta[meta.CRIsPR_available.astype(str).str.lower().eq("yes")]',
-          '''crcol=next(c for c in meta.columns if c.lower()=="crispr_available")
+          crcol=next(c for c in meta.columns if c.lower()=="crispr_available")
           scr=meta[meta[crcol].astype(str).str.lower().eq("yes")].copy()
           crc_s=scr["primary_tumour_type"].astype(str).str.lower().eq("colorectal")
           ov=scr["overlap_Broad_DepMap"].astype(str).str.lower().isin(["yes","true","1"])
@@ -114,7 +126,9 @@ jobs:
           t6["sample_ID"]=t6.sample_ID.astype(str)
           x=t6[t6.sample_ID.isin(keep)].copy()
           per=x.groupby(["sample_ID","gene"],as_index=False).agg(LFC=("LFC","mean"))
-          sg=per.groupby("gene",as_index=False).agg(SangerCRC3D=("LFC","mean"),SangerCRC3D_n=("sample_ID","nunique"))
+          sg=per.groupby("gene",as_index=False).agg(
+              SangerCRC3D=("LFC","mean"),
+              SangerCRC3D_n=("sample_ID","nunique"))
           print("SANGER_CRC_NONOVERLAP_MODELS",len(keep),"GENES",sg.gene.nunique())
 
           d=b3.merge(b2,on="gene",how="inner").merge(sg,on="gene",how="inner")
@@ -126,37 +140,50 @@ jobs:
           r3,pr3=pearsonr(d.BroadCRC3D,d.SangerCRC3D)
           rho2,p2=spearmanr(d.BroadCRC2D,d.SangerCRC3D)
           r2,pr2=pearsonr(d.BroadCRC2D,d.SangerCRC3D)
+
           result={
-            "broad_crc":{"lineages":broad3.OncotreeLineage.astype(str).value_counts().to_dict(),
-                         "3d_screens":len(broad3),"3d_models":broad3.ModelID.astype(str).nunique(),
-                         "2d_screens":len(broad2),"2d_models":broad2.ModelID.astype(str).nunique()},
-            "sanger_crc_nonoverlap_models":len(keep),
-            "shared_genes":len(d),
-            "correlations":{"BroadCRC3D_vs_SangerCRC3D_spearman":float(rho3),
-                            "BroadCRC3D_vs_SangerCRC3D_spearman_p":float(p3),
-                            "BroadCRC3D_vs_SangerCRC3D_pearson":float(r3),
-                            "BroadCRC2D_vs_SangerCRC3D_spearman":float(rho2),
-                            "BroadCRC2D_vs_SangerCRC3D_pearson":float(r2)},
+            "broad_crc":{
+              "lineages":broad3.OncotreeLineage.astype(str).value_counts().to_dict(),
+              "3d_screens":int(len(broad3)),
+              "3d_models":int(broad3.ModelID.astype(str).nunique()),
+              "2d_screens":int(len(broad2)),
+              "2d_models":int(broad2.ModelID.astype(str).nunique())
+            },
+            "sanger_crc_nonoverlap_models":int(len(keep)),
+            "shared_genes":int(len(d)),
+            "correlations":{
+              "BroadCRC3D_vs_SangerCRC3D_spearman":float(rho3),
+              "BroadCRC3D_vs_SangerCRC3D_spearman_p":float(p3),
+              "BroadCRC3D_vs_SangerCRC3D_pearson":float(r3),
+              "BroadCRC3D_vs_SangerCRC3D_pearson_p":float(pr3),
+              "BroadCRC2D_vs_SangerCRC3D_spearman":float(rho2),
+              "BroadCRC2D_vs_SangerCRC3D_spearman_p":float(p2),
+              "BroadCRC2D_vs_SangerCRC3D_pearson":float(r2),
+              "BroadCRC2D_vs_SangerCRC3D_pearson_p":float(pr2)
+            },
             "thresholds":{}
           }
+
           for q in [0.05,0.10,0.20]:
               z=d.copy()
               z["b3"]=z.BroadCRC3D<=z.BroadCRC3D.quantile(q)
               z["s3"]=z.SangerCRC3D<=z.SangerCRC3D.quantile(q)
               z["b2"]=z.BroadCRC2D<=z.BroadCRC2D.quantile(q)
-              k=int((z.b3&z.s3).sum()); a=k; b=int(z.b3.sum()-k); c=int(z.s3.sum()-k); dd=int(len(z)-a-b-c)
+              k=int((z.b3&z.s3).sum())
+              a=k; b=int(z.b3.sum()-k); c=int(z.s3.sum()-k); dd=int(len(z)-a-b-c)
               OR,p=fisher_exact([[a,b],[c,dd]],alternative="greater")
-              universal=int((z.b2&z.b3&z.s3).sum())
-              three_specific=int((~z.b2&z.b3&z.s3).sum())
-              twoD_only=int((z.b2&~z.b3&~z.s3).sum())
-              one3=int((z.b3^z.s3).sum())
               result["thresholds"][str(q)]={
-                  "Broad3D_n":int(z.b3.sum()),"Sanger3D_n":int(z.s3.sum()),
-                  "two3_overlap":k,"overlap_OR":float(OR),"overlap_p":float(p),
-                  "UNIVERSAL_2D_BOTH3D":universal,
-                  "THREE_D_SPECIFIC_CONSENSUS":three_specific,
-                  "TWO_D_ONLY":twoD_only,"ONE_3D_ONLY":one3
+                  "Broad3D_n":int(z.b3.sum()),
+                  "Sanger3D_n":int(z.s3.sum()),
+                  "two3_overlap":k,
+                  "overlap_OR":float(OR),
+                  "overlap_p":float(p),
+                  "UNIVERSAL_2D_BOTH3D":int((z.b2&z.b3&z.s3).sum()),
+                  "THREE_D_SPECIFIC_CONSENSUS":int((~z.b2&z.b3&z.s3).sum()),
+                  "TWO_D_ONLY":int((z.b2&~z.b3&~z.s3).sum()),
+                  "ONE_3D_ONLY":int((z.b3^z.s3).sum())
               }
+
           q=.10
           z=d.copy()
           z["b3"]=z.BroadCRC3D<=z.BroadCRC3D.quantile(q)
@@ -164,9 +191,11 @@ jobs:
           z["b2"]=z.BroadCRC2D<=z.BroadCRC2D.quantile(q)
           hits=z[z.b3&z.s3].copy()
           hits["rank_sum"]=hits.BroadCRC3D.rank()+hits.SangerCRC3D.rank()
-          result["top_q10_consensus"]=hits.sort_values("rank_sum")[["gene","BroadCRC3D","BroadCRC2D","SangerCRC3D"]].head(30).to_dict("records")
+          result["top_q10_consensus"]=hits.sort_values("rank_sum")[
+              ["gene","BroadCRC3D","BroadCRC2D","SangerCRC3D"]
+          ].head(30).to_dict("records")
+
           print("=== O01_EXACT_CRC_RESULT ===")
-          print(json.dumps(result,indent=2,default=str))''')
-          open(p,"w").write(s)
+          print(json.dumps(result,indent=2,default=str))
           PY
           python /tmp/o01_crc_exact.py
