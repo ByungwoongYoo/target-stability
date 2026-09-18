@@ -87,9 +87,21 @@ jobs:
           # OT mappings, essentiality, cancer diseases, clinical precedence
           targets,_=read_dataset("target",["id","approvedSymbol"])
           targets=targets.dropna(subset=["id","approvedSymbol"]).drop_duplicates("id")
-          ess,ess_schema=read_dataset("target_essentiality",["targetId","isEssential"])
+          ess,ess_schema=read_dataset("target_essentiality",["id","geneEssentiality"])
           print("ESS_SCHEMA",ess_schema,"ESS_ROWS",len(ess))
-          ess["isEssential"]=ess["isEssential"].fillna(False).astype(bool)
+          # 26.06 stores gene essentiality as nested records under geneEssentiality.
+          def essential_flag(v):
+              flags=[]
+              def walk(x):
+                  if isinstance(x, dict):
+                      if "isEssential" in x and x["isEssential"] is not None:
+                          flags.append(bool(x["isEssential"]))
+                      for vv in x.values(): walk(vv)
+                  elif isinstance(x, (list,tuple,np.ndarray)):
+                      for vv in x: walk(vv)
+              walk(v)
+              return any(flags)
+          ess["isEssential"]=ess["geneEssentiality"].map(essential_flag)
           diseases,_=read_dataset("disease",["id","therapeuticAreas","ancestors"])
           cancer="MONDO_0045024"
           def is_cancer(r):
@@ -109,7 +121,7 @@ jobs:
           mx=evs.dropna(subset=["approvedSymbol"]).groupby("approvedSymbol",as_index=False).agg(max_stage=("stage","max"))
 
           # map essentiality at approved-symbol grain: any mapped ENSG flagged essential => essential
-          es=ess.merge(targets,left_on="targetId",right_on="id",how="left")
+          es=ess.merge(targets,left_on="id",right_on="id",how="left",validate="one_to_one")
           esym=(es.dropna(subset=["approvedSymbol"]).groupby("approvedSymbol",as_index=False)
                 .agg(isEssential=("isEssential","max")))
 
