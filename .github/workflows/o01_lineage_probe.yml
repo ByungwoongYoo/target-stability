@@ -1,0 +1,64 @@
+name: O01 lineage mapping probe
+
+on:
+  push:
+    branches:
+      - o01-lineage-scratch-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl
+      - name: Probe Broad screen-to-model mapping
+        shell: bash
+        run: |
+          cat > /tmp/probe.py <<'PY'
+          import io, json, requests, pandas as pd
+          UA={"User-Agent":"o01-lineage-probe/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          base="https://depmap.org/portal/breadbox"
+          dsid="fa1b635a-5116-4a93-b66d-84eca7e2a402"
+          def get(url):
+              r=requests.get(url,headers=UA,timeout=120); r.raise_for_status(); return r
+          def post(url,payload):
+              r=requests.post(url,headers=UA,json=payload,timeout=120); r.raise_for_status(); return r
+          samples=get(f"{base}/datasets/samples/{dsid}").json()
+          print("SAMPLE_TYPE",type(samples).__name__,"N",len(samples))
+          print("SAMPLE_FIRST10",json.dumps(samples[:10],indent=2)[:12000])
+          # broad official NextGen metadata
+          url=("https://media.springernature.com/original/springer-static/esm/"
+               "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM3_ESM.xlsx")
+          b=get(url).content
+          md=pd.read_excel(io.BytesIO(b),sheet_name="NextGen Model Metadata")
+          print("MD_ROWS",len(md))
+          print("MD_LINEAGE_COUNTS",md["Lineage"].astype(str).value_counts().head(30).to_dict())
+          print("MD_CRISPR_VALUES",md["HasCRISPRData"].astype(str).value_counts(dropna=False).to_dict())
+          print("MD_FORMAT_VALUES",md["Culture Format"].astype(str).value_counts(dropna=False).to_dict())
+          cris=md[md["HasCRISPRData"].astype(str).str.lower().isin(["yes","true","1","y"])].copy()
+          print("MD_CRISPR_N",len(cris))
+          print("MD_CRISPR_LINEAGE_COUNTS",cris["Lineage"].astype(str).value_counts().to_dict())
+          print("MD_CRISPR_FIRST20",cris[["Model ID","Cell Line Name","Lineage","Culture Format"]].head(20).to_json(orient="records"))
+          # model metadata from Breadbox
+          mm=post(f"{base}/datasets/tabular/depmap_model_metadata",
+                  {"columns":["ModelID","CellLineName","OncotreeLineage","OncotreePrimaryDisease"]}).json()
+          print("MODEL_META_KEYS",list(mm.keys()))
+          for k,v in mm.items():
+              if isinstance(v,dict):
+                  print("MODEL_META",k,"N",len(v),"FIRST5",list(v.items())[:5])
+              elif isinstance(v,list):
+                  print("MODEL_META",k,"N",len(v),"FIRST5",v[:5])
+              else:
+                  print("MODEL_META",k,type(v).__name__,str(v)[:500])
+          # matrix structure for one gene
+          mat=post(f"{base}/datasets/matrix/{dsid}",
+                   {"features":["EGFR"],"feature_identifier":"label"}).json()
+          v=mat["EGFR"]
+          print("MATRIX_EGFR_TYPE",type(v).__name__,"N",len(v))
+          print("MATRIX_EGFR_FIRST10",list(v.items())[:10] if isinstance(v,dict) else v[:10])
+          PY
+          python /tmp/probe.py
