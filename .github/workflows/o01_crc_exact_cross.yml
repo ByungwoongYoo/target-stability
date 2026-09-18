@@ -103,8 +103,7 @@ jobs:
                   gene=fmap.get(str(k),str(k))
                   rows.append({"gene":gene,name:v})
               out=pd.DataFrame(rows)
-              print(name,"GENES",len(out),"COUNT_RANGE",
-                    [int(pd.to_numeric(out[name+"_n"]).min()),int(pd.to_numeric(out[name+"_n"]).max())])
+              print(name,"GENES",len(out),"REQUESTED_SCREENS",len(set(ids)))
               return out
 
           b3=aggregate(broad3.screen_id.tolist(),"BroadCRC3D")
