@@ -98,6 +98,11 @@ jobs:
               x["class"]=np.select(
                   [x.b3 & x.s3, x.b2 & ~x.b3 & ~x.s3],
                   ["TWO_3D_CONSENSUS","TWO_D_ONLY"], default="OTHER")
+              x["subclass"]=np.select(
+                  [x.b2 & x.b3 & x.s3,
+                   ~x.b2 & x.b3 & x.s3,
+                   x.b2 & ~x.b3 & ~x.s3],
+                  ["UNIVERSAL_2D_BOTH3D","THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY"], default="OTHER")
               return x,{"broad3d_cut":float(b3cut),"sanger3d_cut":float(s3cut),"broad2d_cut":float(b2cut)}
 
           # 2) OT disease ontology + cancer therapeutic area.
@@ -198,14 +203,34 @@ jobs:
                       "twoD_n":int(len(b)),"twoD_event":be,"twoD_rate":float(be/len(b)),
                       "odds_ratio":float(OR),"fisher_p":float(p)
                   })
+
+              # Clean added-value test: among 2D hits, does replication in BOTH independent 3D resources
+              # enrich for oncology clinical translation versus 2D-only hits?
+              filter_validation=[]
+              for comparator in ["UNIVERSAL_2D_BOTH3D","THREE_D_SPECIFIC_CONSENSUS"]:
+                  aa=g[g["subclass"]==comparator]
+                  bb=g[g["subclass"]=="TWO_D_ONLY"]
+                  for name in endpoint_defs:
+                      aev=int(aa[name].sum()); bev=int(bb[name].sum())
+                      OR,p=fisher_exact([[aev,len(aa)-aev],[bev,len(bb)-bev]],alternative="two-sided")
+                      filter_validation.append({
+                          "comparison":f"{comparator}_vs_TWO_D_ONLY","endpoint":name,
+                          "group_n":int(len(aa)),"group_event":aev,
+                          "group_rate":float(aev/len(aa)) if len(aa) else None,
+                          "twoD_n":int(len(bb)),"twoD_event":bev,
+                          "twoD_rate":float(bev/len(bb)) if len(bb) else None,
+                          "odds_ratio":float(OR),"fisher_p":float(p)
+                      })
               a=g[g["class"]=="TWO_3D_CONSENSUS"]["max_oncology_stage"]
               b=g[g["class"]=="TWO_D_ONLY"]["max_oncology_stage"]
               u,p=mannwhitneyu(a,b,alternative="two-sided")
               out={
                   "q":q,"cuts":cuts,
                   "class_counts":g["class"].value_counts().to_dict(),
+                  "subclass_counts":g["subclass"].value_counts().to_dict(),
                   "mapped_targets":int(g["oncology_evidence_rows"].gt(0).sum()),
                   "enrichment":result,
+                  "filter_validation":filter_validation,
                   "mean_max_oncology_stage":g.groupby("class")["max_oncology_stage"].mean().to_dict(),
                   "mw_stage_u":float(u),"mw_stage_p":float(p)
               }
