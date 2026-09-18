@@ -1,0 +1,195 @@
+name: O01 translational enrichment
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install requests pandas openpyxl scipy boto3 pyarrow
+      - name: Run translational enrichment
+        shell: bash
+        run: |
+          cat > /tmp/o01_translate.py <<'PY'
+          import io, json, re, zipfile
+          import boto3, pandas as pd, numpy as np, pyarrow.parquet as pq
+          from botocore import UNSIGNED
+          from botocore.config import Config
+          from scipy.stats import fisher_exact
+          import requests
+
+          UA={"User-Agent":"o01-translation/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          def get(url):
+              r=requests.get(url,headers=UA,timeout=180); r.raise_for_status(); return r.content
+
+          # --- reconstruct O01 frozen pilot classes (10%) ---
+          burl=("https://media.springernature.com/original/springer-static/esm/"
+                "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM12_ESM.xlsx")
+          broad=pd.read_excel(io.BytesIO(get(burl)),sheet_name="Fig5b diff deps volcano")
+          broad=broad[["GeneSymbol","OrganoidsMean","AdherentMean"]].copy()
+          broad["gene"]=broad["GeneSymbol"].astype(str).str.strip()
+          broad=broad.dropna(subset=["gene","OrganoidsMean","AdherentMean"]).drop_duplicates("gene")
+
+          surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
+                "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
+          z=zipfile.ZipFile(io.BytesIO(get(surl)))
+          meta=pd.read_excel(io.BytesIO(z.read("supplementary_table_2_revision.xlsx")),sheet_name="data_availability")
+          t5=pd.read_csv(io.BytesIO(z.read("supplementary_table_5_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","is_depleted"])
+          t6=pd.read_csv(io.BytesIO(z.read("supplementary_table_6_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","LFC"])
+          meta["sample_ID"]=meta["sample_ID"].astype(str)
+          screened=meta[meta["CRISPR_available"].astype(str).str.lower().eq("yes")].copy()
+          def yes(s): return s.astype(str).str.lower().isin(["yes","true","1"])
+          x=t6.merge(t5,on=["sample_ID","gene","library"],how="inner",validate="one_to_one")
+          pm=x.groupby(["sample_ID","gene"],as_index=False).agg(LFC=("LFC","mean"),is_depleted=("is_depleted","max"))
+          pm=pm.merge(screened[["sample_ID","overlap_Broad_DepMap"]],on="sample_ID",how="inner",validate="many_to_one")
+          sg=(pm[~yes(pm["overlap_Broad_DepMap"])]
+              .groupby("gene",as_index=False)
+              .agg(sanger_mean_LFC=("LFC","mean")))
+          d=broad.merge(sg,on="gene",how="inner").dropna().copy()
+          q=.10
+          d["b3"]=d["OrganoidsMean"]<=d["OrganoidsMean"].quantile(q)
+          d["s3"]=d["sanger_mean_LFC"]<=d["sanger_mean_LFC"].quantile(q)
+          d["b2"]=d["AdherentMean"]<=d["AdherentMean"].quantile(q)
+          d["class"]=np.select(
+              [d.b3 & d.s3, d.b2 & ~d.b3 & ~d.s3],
+              ["TWO_3D_CONSENSUS","2D_ONLY"], default="OTHER")
+          classes=d[d["class"].isin(["TWO_3D_CONSENSUS","2D_ONLY"])][["gene","class"]].copy()
+          print("CLASS_COUNTS",classes["class"].value_counts().to_dict())
+
+          # --- Open Targets 26.06 on anonymous public S3 ---
+          bucket="open-targets-public-data-releases"
+          base="platform/26.06/output/"
+          s3=boto3.client("s3",config=Config(signature_version=UNSIGNED),region_name="eu-west-1")
+          def list_parquet(prefix):
+              out=[]; token=None
+              while True:
+                  kw={"Bucket":bucket,"Prefix":prefix}
+                  if token: kw["ContinuationToken"]=token
+                  resp=s3.list_objects_v2(**kw)
+                  for o in resp.get("Contents",[]):
+                      if o["Key"].endswith(".parquet"): out.append((o["Key"],int(o["Size"])))
+                  if not resp.get("IsTruncated"): break
+                  token=resp["NextContinuationToken"]
+              return out
+          target_objs=list_parquet(base+"target/")
+          clinical_objs=list_parquet(base+"clinical_target/")
+          print("OT_OBJECTS",json.dumps({
+              "target_n":len(target_objs),"target_bytes":sum(s for _,s in target_objs),
+              "clinical_target_n":len(clinical_objs),"clinical_target_bytes":sum(s for _,s in clinical_objs),
+              "target_first":target_objs[:3],"clinical_first":clinical_objs[:3]
+          }))
+          if not target_objs or not clinical_objs:
+              raise RuntimeError("Open Targets target or clinical_target parquet not found")
+
+          def read_all(objs, wanted=None):
+              frames=[]
+              for i,(key,size) in enumerate(objs):
+                  bio=io.BytesIO(); s3.download_fileobj(bucket,key,bio); bio.seek(0)
+                  pf=pq.ParquetFile(bio)
+                  if i==0: print("SCHEMA",key,str(pf.schema_arrow))
+                  cols=None
+                  if wanted:
+                      avail=set(pf.schema_arrow.names); cols=[c for c in wanted if c in avail]
+                  frames.append(pf.read(columns=cols).to_pandas())
+              return pd.concat(frames,ignore_index=True)
+
+          target=read_all(target_objs,["id","approvedSymbol","approvedName"])
+          print("TARGET_COLUMNS",list(target.columns),"ROWS",len(target))
+          if not {"id","approvedSymbol"}.issubset(target.columns):
+              raise RuntimeError("target mapping columns missing")
+          target=target[["id","approvedSymbol"]].dropna().drop_duplicates("approvedSymbol")
+          m=classes.merge(target,left_on="gene",right_on="approvedSymbol",how="left")
+          print("MAPPING",m.groupby("class")["id"].agg(["count","size"]).to_dict())
+
+          # clinical_target is expected to be compact enough to load; inspect full schema.
+          ct=read_all(clinical_objs,None)
+          print("CLINICAL_COLUMNS",list(ct.columns),"ROWS",len(ct))
+          print("CLINICAL_HEAD",ct.head(3).to_json(orient="records",default_handler=str))
+
+          # detect target and stage columns robustly
+          cols=list(ct.columns)
+          target_col=next((c for c in ["targetId","target_id","target"] if c in cols),None)
+          stage_col=next((c for c in ["clinicalStage","clinical_stage","stage","phase","clinicalPhase","maxPhase","maxClinicalPhase"] if c in cols),None)
+          if target_col is None:
+              target_col=next((c for c in cols if "target" in c.lower() and "id" in c.lower()),None)
+          if stage_col is None:
+              stage_col=next((c for c in cols if ("stage" in c.lower() or "phase" in c.lower()) and "reason" not in c.lower()),None)
+          print("DETECTED",{"target_col":target_col,"stage_col":stage_col})
+          if target_col is None or stage_col is None:
+              raise RuntimeError("Could not detect target/stage columns in clinical_target")
+
+          # normalize stage and build target-level maximum stage
+          def rank(v):
+              if pd.isna(v): return -1
+              s=str(v).strip().upper().replace("_"," ").replace("-"," ")
+              # numeric phases where present
+              if s in {"4","4.0"}: return 8
+              if s in {"3","3.0"}: return 6
+              if s in {"2","2.0"}: return 4
+              if s in {"1","1.0"}: return 2
+              if "APPROV" in s: return 9
+              if "PHASE IV" in s or "PHASE 4" in s: return 8
+              if "PREAPPROV" in s: return 7
+              if "PHASE III" in s or "PHASE 3" in s: return 6
+              if "PHASE II/III" in s or ("PHASE II" in s and "III" in s): return 5
+              if "PHASE II" in s or "PHASE 2" in s: return 4
+              if "PHASE I/II" in s or ("PHASE I" in s and "II" in s): return 3
+              if re.search(r"PHASE\s+I(\b|$)",s) or "PHASE 1" in s: return 2
+              if "EARLY PHASE I" in s: return 1
+              if "IND" == s or "PRECLIN" in s: return 0
+              return -1
+          ct=ct[[target_col,stage_col]].dropna(subset=[target_col]).copy()
+          ct["stage_rank"]=ct[stage_col].map(rank)
+          maxstage=ct.groupby(target_col,as_index=False)["stage_rank"].max()
+          mm=m.merge(maxstage,left_on="id",right_on=target_col,how="left")
+          mm["stage_rank"]=mm["stage_rank"].fillna(-1)
+
+          endpoints={
+              "ANY_CLINICAL": lambda s:s>=1,
+              "PHASE_I_PLUS": lambda s:s>=2,
+              "PHASE_II_PLUS":lambda s:s>=4,
+              "PHASE_III_PLUS":lambda s:s>=6,
+              "APPROVAL":lambda s:s>=9,
+          }
+          results={}
+          for name,fn in endpoints.items():
+              flag=fn(mm["stage_rank"])
+              tab={}
+              for cl in ["TWO_3D_CONSENSUS","2D_ONLY"]:
+                  z=mm[mm["class"].eq(cl)]
+                  zz=fn(z["stage_rank"])
+                  tab[cl]={"n":int(len(z)),"hit":int(zz.sum()),"pct":float(100*zz.mean())}
+              a=tab["TWO_3D_CONSENSUS"]["hit"]; b=tab["TWO_3D_CONSENSUS"]["n"]-a
+              c=tab["2D_ONLY"]["hit"]; dd=tab["2D_ONLY"]["n"]-c
+              OR,p=fisher_exact([[a,b],[c,dd]],alternative="two-sided")
+              results[name]={"groups":tab,"OR":float(OR),"fisher_p":float(p)}
+          stage_dist=(mm.groupby(["class","stage_rank"]).size().reset_index(name="n")
+                      .sort_values(["class","stage_rank"]))
+          result={"release":"Open Targets 26.06","class_counts":classes["class"].value_counts().to_dict(),
+                  "mapped_counts":mm.groupby("class")["id"].count().to_dict(),
+                  "endpoints":results,
+                  "stage_distribution":stage_dist.to_dict("records")}
+          print("=== O01_TRANSLATIONAL_RESULT ===")
+          print(json.dumps(result,indent=2))
+          with open("o01_translation_result.json","w") as f: json.dump(result,f,indent=2)
+          PY
+          python /tmp/o01_translate.py
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: o01-translation-result
+          path: o01_translation_result.json
+          if-no-files-found: ignore
+          retention-days: 3
