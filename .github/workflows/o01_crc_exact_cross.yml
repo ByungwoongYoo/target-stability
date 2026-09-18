@@ -97,7 +97,7 @@ jobs:
                   "samples":sorted(set(ids)),
                   "aggregate":{"aggregate_by":"samples","aggregation":"mean"}
               })
-              mean=obj["mean"]; cnt=obj["count"]
+              mean=obj["mean"]
               rows=[]
               for k,v in mean.items():
                   gene=fmap.get(str(k),str(k))
