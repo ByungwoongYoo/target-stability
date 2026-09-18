@@ -1,0 +1,255 @@
+name: O01 oncology-specific translational enrichment
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  oncology:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl scipy pyarrow
+      - name: Run oncology-specific analysis
+        shell: bash
+        run: |
+          mkdir -p o01_oncology
+          cat > /tmp/o01_oncology.py <<'PY'
+          import io, json, re, zipfile, urllib.parse, xml.etree.ElementTree as ET
+          from pathlib import Path
+          import requests, pandas as pd, numpy as np, pyarrow.parquet as pq
+          from scipy.stats import fisher_exact, mannwhitneyu
+
+          OUT=Path("o01_oncology"); OUT.mkdir(exist_ok=True)
+          UA={"User-Agent":"o01-oncology/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          S3ROOT="https://open-targets-public-data-releases.s3.amazonaws.com/"
+          NS={"s3":"http://s3.amazonaws.com/doc/2006-03-01/"}
+
+          def get(url, **kw):
+              h=UA.copy(); h.update(kw.pop("headers",{}))
+              r=requests.get(url,headers=h,timeout=240,**kw)
+              r.raise_for_status()
+              return r
+
+          def list_keys(prefix):
+              keys=[]; token=None
+              while True:
+                  params={"list-type":"2","prefix":prefix,"max-keys":"1000"}
+                  if token: params["continuation-token"]=token
+                  root=ET.fromstring(get(S3ROOT,params=params).content)
+                  keys += [x.find("s3:Key",NS).text for x in root.findall("s3:Contents",NS)]
+                  if root.findtext("s3:IsTruncated",default="false",namespaces=NS)!="true": break
+                  token=root.findtext("s3:NextContinuationToken",default=None,namespaces=NS)
+              return keys
+
+          def read_dataset(name, wanted=None):
+              keys=[k for k in list_keys(f"platform/26.06/output/{name}/") if k.endswith(".parquet")]
+              if not keys: raise RuntimeError("No parquet for "+name)
+              frames=[]; schema=None
+              for k in keys:
+                  tab=pq.read_table(io.BytesIO(get(S3ROOT+urllib.parse.quote(k,safe="/")).content))
+                  if schema is None: schema=tab.schema.names
+                  cols=[c for c in (wanted or tab.schema.names) if c in tab.schema.names]
+                  frames.append(tab.select(cols).to_pandas())
+              return pd.concat(frames,ignore_index=True),schema,keys
+
+          # 1) EXACTLY reproduce the frozen Broad-Sanger class construction.
+          burl=("https://media.springernature.com/original/springer-static/esm/"
+                "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM12_ESM.xlsx")
+          broad=pd.read_excel(io.BytesIO(get(burl).content),sheet_name="Fig5b diff deps volcano")
+          broad=broad[["GeneSymbol","OrganoidsMean","OrganoidsN","AdherentMean","AdherentN",
+                       "MeanDifference","MannWhitneyPValue","MannWhitneyFDR","Cluster"]].copy()
+          broad["gene"]=broad["GeneSymbol"].astype(str).str.strip()
+          broad=broad.dropna(subset=["gene","OrganoidsMean","AdherentMean"]).drop_duplicates("gene")
+
+          surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
+                "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
+          z=zipfile.ZipFile(io.BytesIO(get(surl).content))
+          meta=pd.read_excel(io.BytesIO(z.read("supplementary_table_2_revision.xlsx")),sheet_name="data_availability")
+          t5=pd.read_csv(io.BytesIO(z.read("supplementary_table_5_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","is_depleted"])
+          t6=pd.read_csv(io.BytesIO(z.read("supplementary_table_6_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","LFC"])
+          meta["sample_ID"]=meta["sample_ID"].astype(str)
+          screened=meta[meta["CRISPR_available"].astype(str).str.lower().eq("yes")].copy()
+          def yes(s): return s.astype(str).str.lower().isin(["yes","true","1"])
+          x=t6.merge(t5,on=["sample_ID","gene","library"],how="inner",validate="one_to_one")
+          pm=x.groupby(["sample_ID","gene"],as_index=False).agg(LFC=("LFC","mean"),is_depleted=("is_depleted","max"))
+          pm=pm.merge(screened[["sample_ID","overlap_Broad_DepMap"]],on="sample_ID",how="inner",validate="many_to_one")
+          sg=(pm[~yes(pm["overlap_Broad_DepMap"])].groupby("gene",as_index=False).agg(
+              sanger_n=("sample_ID","nunique"),
+              sanger_mean_LFC=("LFC","mean"),
+              sanger_median_LFC=("LFC","median"),
+              sanger_frac_depleted=("is_depleted","mean")))
+          d=broad.merge(sg,on="gene",how="inner").dropna(subset=["OrganoidsMean","AdherentMean","sanger_mean_LFC"]).copy()
+
+          def classes_at(q):
+              x=d.copy()
+              b3cut=x["OrganoidsMean"].quantile(q); s3cut=x["sanger_mean_LFC"].quantile(q); b2cut=x["AdherentMean"].quantile(q)
+              x["b3"]=x["OrganoidsMean"]<=b3cut
+              x["s3"]=x["sanger_mean_LFC"]<=s3cut
+              x["b2"]=x["AdherentMean"]<=b2cut
+              x["class"]=np.select(
+                  [x.b3 & x.s3, x.b2 & ~x.b3 & ~x.s3],
+                  ["TWO_3D_CONSENSUS","TWO_D_ONLY"], default="OTHER")
+              return x,{"broad3d_cut":float(b3cut),"sanger3d_cut":float(s3cut),"broad2d_cut":float(b2cut)}
+
+          # 2) OT disease ontology + cancer therapeutic area.
+          diseases,disease_schema,_=read_dataset("disease",["id","name","therapeuticAreas","ancestors"])
+          CANCER_TA="MONDO_0045024"
+          def is_cancer_row(r):
+              vals=[]
+              for c in ["therapeuticAreas","ancestors"]:
+                  v=r.get(c)
+                  if isinstance(v,(list,tuple,np.ndarray)): vals.extend([str(z) for z in v])
+              return CANCER_TA in vals or str(r.get("id"))==CANCER_TA
+          diseases["is_oncology"]=diseases.apply(is_cancer_row,axis=1)
+          cancer_ids=set(diseases.loc[diseases.is_oncology,"id"].astype(str))
+          ta_name=diseases.loc[diseases.id.astype(str).eq(CANCER_TA),"name"].astype(str).tolist()
+          print("CANCER_TA",CANCER_TA,ta_name,"N_DISEASES",len(cancer_ids))
+
+          # 3) Clinical precedence: target-disease-stage evidence.
+          ev,ev_schema,_=read_dataset("evidence_clinical_precedence",
+              ["targetId","diseaseId","clinicalStage","drugId","datasourceId","clinicalReportId","trialWhyStopped"])
+          ev=ev[ev["diseaseId"].astype(str).isin(cancer_ids)].copy()
+          print("ONCOLOGY_PRECEDENCE_ROWS",len(ev),"TARGETS",ev["targetId"].nunique(),"DRUGS",ev["drugId"].nunique())
+
+          stage_rank={
+              "UNKNOWN":0.0,"PRECLINICAL":0.1,"IND":0.5,"EARLY_PHASE_1":0.75,
+              "PHASE_1":1.0,"PHASE_1_2":1.5,"PHASE_2":2.0,"PHASE_2_3":2.5,
+              "PHASE_3":3.0,"PREAPPROVAL":3.5,"APPROVAL":4.0,"PHASE_4":4.0,"WITHDRAWAL":4.0
+          }
+          ev["stage_num"]=ev["clinicalStage"].astype(str).map(stage_rank).fillna(0.0)
+          ev["approval_history"]=ev["clinicalStage"].astype(str).isin(["APPROVAL","PHASE_4","WITHDRAWAL"])
+
+          # 4) Mechanism target multiplicity for a stricter single-target-drug sensitivity analysis.
+          moa,moa_schema,_=read_dataset("drug_mechanism_of_action",["chemblIds","targets","targetType","actionType"])
+          pairs=[]
+          for _,r in moa.iterrows():
+              ds=r.get("chemblIds"); ts=r.get("targets")
+              if not isinstance(ds,(list,tuple,np.ndarray)) or not isinstance(ts,(list,tuple,np.ndarray)): continue
+              for drug in ds:
+                  for target in ts:
+                      if pd.notna(drug) and pd.notna(target): pairs.append((str(drug),str(target)))
+          pairdf=pd.DataFrame(pairs,columns=["drugId","targetId"]).drop_duplicates()
+          nt=pairdf.groupby("drugId")["targetId"].nunique().rename("drug_target_count")
+          ev=ev.merge(nt,on="drugId",how="left")
+          ev["drug_target_count"]=ev["drug_target_count"].fillna(999).astype(int)
+
+          # 5) Target symbol mapping.
+          targets,target_schema,_=read_dataset("target",["id","approvedSymbol"])
+          targets=targets.drop_duplicates("id")
+
+          def summarize(q):
+              cls,cuts=classes_at(q)
+              study=cls[cls["class"].isin(["TWO_3D_CONSENSUS","TWO_D_ONLY"])].copy()
+              study=study.merge(targets,left_on="gene",right_on="approvedSymbol",how="left")
+              # all oncology evidence
+              mx=ev.groupby("targetId",as_index=False).agg(
+                  max_oncology_stage=("stage_num","max"),
+                  oncology_evidence_rows=("stage_num","size"),
+                  oncology_drug_n=("drugId","nunique"),
+                  oncology_approval_history=("approval_history","max"))
+              # single-target mechanism sensitivity
+              se=ev[ev["drug_target_count"].eq(1)].copy()
+              smx=se.groupby("targetId",as_index=False).agg(
+                  max_oncology_stage_single=("stage_num","max"),
+                  oncology_single_drug_n=("drugId","nunique"),
+                  oncology_approval_single=("approval_history","max"))
+              g=study.merge(mx,left_on="id",right_on="targetId",how="left").drop(columns=["targetId"],errors="ignore")
+              g=g.merge(smx,left_on="id",right_on="targetId",how="left").drop(columns=["targetId"],errors="ignore")
+              for c in ["max_oncology_stage","max_oncology_stage_single"]:
+                  g[c]=g[c].fillna(0.0)
+              for c in ["oncology_evidence_rows","oncology_drug_n","oncology_single_drug_n"]:
+                  g[c]=g[c].fillna(0).astype(int)
+              for c in ["oncology_approval_history","oncology_approval_single"]:
+                  g[c]=g[c].fillna(False).astype(bool)
+
+              endpoint_defs={
+                "onc_human_any": g["max_oncology_stage"]>=0.75,
+                "onc_phase2plus": g["max_oncology_stage"]>=2.0,
+                "onc_phase3plus": g["max_oncology_stage"]>=3.0,
+                "onc_approval_history": g["oncology_approval_history"],
+                "single_onc_human_any": g["max_oncology_stage_single"]>=0.75,
+                "single_onc_phase2plus": g["max_oncology_stage_single"]>=2.0,
+                "single_onc_phase3plus": g["max_oncology_stage_single"]>=3.0,
+                "single_onc_approval_history": g["oncology_approval_single"],
+              }
+              result=[]
+              for name,ser in endpoint_defs.items():
+                  g[name]=ser
+                  a=g[g["class"]=="TWO_3D_CONSENSUS"]; b=g[g["class"]=="TWO_D_ONLY"]
+                  ae=int(a[name].sum()); be=int(b[name].sum())
+                  OR,p=fisher_exact([[ae,len(a)-ae],[be,len(b)-be]],alternative="two-sided")
+                  result.append({
+                      "endpoint":name,
+                      "consensus_n":int(len(a)),"consensus_event":ae,"consensus_rate":float(ae/len(a)),
+                      "twoD_n":int(len(b)),"twoD_event":be,"twoD_rate":float(be/len(b)),
+                      "odds_ratio":float(OR),"fisher_p":float(p)
+                  })
+              a=g[g["class"]=="TWO_3D_CONSENSUS"]["max_oncology_stage"]
+              b=g[g["class"]=="TWO_D_ONLY"]["max_oncology_stage"]
+              u,p=mannwhitneyu(a,b,alternative="two-sided")
+              out={
+                  "q":q,"cuts":cuts,
+                  "class_counts":g["class"].value_counts().to_dict(),
+                  "mapped_targets":int(g["id"].notna().sum()),
+                  "enrichment":result,
+                  "mean_max_oncology_stage":g.groupby("class")["max_oncology_stage"].mean().to_dict(),
+                  "mw_stage_u":float(u),"mw_stage_p":float(p)
+              }
+              g.to_csv(OUT/f"oncology_gene_evidence_q{int(q*100)}.csv",index=False)
+              return out,g
+
+          allres=[]; frames={}
+          for q in [0.05,0.10,0.20]:
+              r,g=summarize(q); allres.append(r); frames[q]=g
+
+          g=frames[0.10]
+          hits=(g[g["class"]=="TWO_3D_CONSENSUS"]
+                .sort_values(["max_oncology_stage","oncology_approval_history","OrganoidsMean","sanger_mean_LFC"],
+                             ascending=[False,False,True,True])
+                [["gene","max_oncology_stage","oncology_approval_history","oncology_drug_n",
+                  "max_oncology_stage_single","oncology_single_drug_n",
+                  "OrganoidsMean","AdherentMean","sanger_mean_LFC","Cluster"]].head(100))
+          hits.to_csv(OUT/"top_oncology_consensus_hits.csv",index=False)
+
+          result={
+              "release":"Open Targets Platform 26.06",
+              "cancer_therapeutic_area":{"id":CANCER_TA,"name":ta_name[0] if ta_name else None,
+                                         "n_descendant_or_mapped_diseases":len(cancer_ids)},
+              "shared_gene_universe":int(len(d)),
+              "frozen_q10_expected":{"TWO_3D_CONSENSUS":729,"TWO_D_ONLY":278},
+              "frozen_q10_reproduced":allres[1]["class_counts"],
+              "oncology_precedence_rows":int(len(ev)),
+              "oncology_precedence_targets":int(ev["targetId"].nunique()),
+              "oncology_precedence_drugs":int(ev["drugId"].nunique()),
+              "single_target_oncology_rows":int((ev["drug_target_count"]==1).sum()),
+              "sensitivity":allres,
+              "top_q10_consensus_hits":hits.to_dict("records"),
+              "method_notes":[
+                  "Cancer filter uses Open Targets disease therapeutic area MONDO_0045024 (cancer or benign tumor).",
+                  "Clinical stage comes from evidence_clinical_precedence target-disease evidence, not drug-level clinical_target maximum stage.",
+                  "Single-target sensitivity keeps evidence whose ChEMBL drug maps to exactly one Open Targets mechanism target.",
+                  "Sanger models explicitly marked as overlapping Broad are excluded.",
+                  "Gene classes exactly reproduce the original Table5+Table6 frozen workflow."
+              ]
+          }
+          (OUT/"result.json").write_text(json.dumps(result,indent=2,default=str))
+          print("=== O01_ONCOLOGY_RESULT ===")
+          print(json.dumps(result,indent=2,default=str))
+          PY
+          python /tmp/o01_oncology.py
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: o01-oncology
+          path: o01_oncology/
+          if-no-files-found: error
+          retention-days: 7
