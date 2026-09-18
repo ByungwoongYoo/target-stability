@@ -1,0 +1,66 @@
+name: O01 NextGen screen metadata probe
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Probe Breadbox screen_nextgen dimension
+        shell: bash
+        run: |
+          pip install requests
+          cat > /tmp/probe.py <<'PY'
+          import json, requests, time
+          BASE="https://depmap.org/portal/breadbox"
+          H={"User-Agent":"o01-crc-lineage/0.1 (+https://github.com/ByungwoongYoo/target-stability)","Accept":"application/json"}
+          def req(method,ep,**kw):
+              url=BASE+"/"+ep.lstrip("/")
+              for a in range(6):
+                  try:
+                      r=requests.request(method,url,headers=H,timeout=120,**kw)
+                      if r.status_code < 500:
+                          r.raise_for_status()
+                          return r.json()
+                  except Exception as e:
+                      err=repr(e)
+                  time.sleep(2*(a+1))
+              raise RuntimeError((ep,err))
+          dsid="fa1b635a-5116-4a93-b66d-84eca7e2a402"
+          dims=req("GET","types/dimensions")
+          print("DIMENSION_SCREEN_NEXTGEN",json.dumps([x for x in dims if "nextgen" in json.dumps(x).lower()],default=str))
+          for params in [{"feature_type":"screen_nextgen"},{"sample_type":"screen_nextgen"}]:
+              d=req("GET","datasets/",params=params)
+              print("DATASETS",params,json.dumps(d,default=str)[:20000])
+          all_ds=req("GET","datasets/")
+          hits=[x for x in all_ds if "nextgen" in json.dumps(x).lower() or "screen_nextgen" in json.dumps(x).lower()]
+          print("ALL_NEXTGEN_HITS",json.dumps(hits,default=str)[:30000])
+          mat=req("POST",f"datasets/matrix/{dsid}",json={"features":["KRAS"],"feature_identifier":"label"})
+          vals=mat.get("KRAS",{})
+          print("MATRIX_SAMPLE_N",len(vals))
+          print("MATRIX_SAMPLE_HEAD",json.dumps(list(vals.items())[:30],default=str))
+          # Try likely tabular dataset identifiers discovered from hits + common names.
+          candidates=[]
+          for x in hits:
+              if x.get("format")=="tabular_dataset":
+                  for k in ["id","given_id"]:
+                      if x.get(k): candidates.append(x[k])
+          candidates += ["screen_nextgen_metadata","screen_nextgen","nextgen_screen_metadata","NextGenScreenMetadata"]
+          seen=set()
+          for cand in candidates:
+              if cand in seen: continue
+              seen.add(cand)
+              try:
+                  feat=req("GET",f"datasets/features/{cand}")
+                  print("TAB_FEATURES",cand,json.dumps(feat,default=str)[:12000])
+              except Exception as e:
+                  print("TAB_FEATURES_ERR",cand,repr(e))
+          PY
+          python /tmp/probe.py
