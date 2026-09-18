@@ -99,9 +99,9 @@ jobs:
           names=[p.rstrip("/").split("/")[-1] for p in top_prefixes]
           print("OT26.06_DATASETS",names)
           target_name="target" if "target" in names else next((n for n in names if n.startswith("target")),None)
-          kd_candidates=[n for n in names if ("known" in n.lower() and "drug" in n.lower())]
-          if not kd_candidates:
-              kd_candidates=[n for n in names if "drug" in n.lower()]
+          kd_candidates=[n for n in ["evidence_clinical_precedence","clinical_target","clinical_indication","clinical_report","target_prioritisation"] if n in names]
+          kd_candidates += [n for n in names if ("known" in n.lower() and "drug" in n.lower())]
+          kd_candidates += [n for n in names if "drug" in n.lower() and n not in kd_candidates]
           print("TARGET_DATASET",target_name,"DRUG_CANDIDATES",kd_candidates)
           if not target_name:
               raise RuntimeError("Open Targets target dataset not found")
@@ -140,10 +140,10 @@ jobs:
                   tab=pq.read_table(io.BytesIO(b))
                   sch=tab.schema.names
                   has_target=any(c in sch for c in ["targetId","target_id","target"])
-                  has_phase=any(c in sch for c in ["phase","clinicalPhase","maxPhaseForIndication","maximumClinicalTrialPhase","maxPhase"])
+                  has_phase=any(c in sch for c in ["phase","clinicalPhase","clinicalStage","maxPhaseForIndication","maximumClinicalTrialPhase","maximumClinicalStage","maxPhase"])
                   print("CANDIDATE",n,sch[:80],"HAS",has_target,has_phase)
                   if has_target and has_phase:
-                      wanted=[c for c in ["targetId","target_id","target","drugId","drug_id","phase","clinicalPhase","maxPhaseForIndication","maximumClinicalTrialPhase","maxPhase","status","diseaseId","disease_id"] if c in sch]
+                      wanted=[c for c in ["targetId","target_id","target","drugId","drug_id","phase","clinicalPhase","clinicalStage","maxPhaseForIndication","maximumClinicalTrialPhase","maximumClinicalStage","maxPhase","status","diseaseId","disease_id"] if c in sch]
                       frames=[]
                       for k in keys:
                           bb=get(S3ROOT+urllib.parse.quote(k,safe="/")).content
@@ -181,9 +181,27 @@ jobs:
           
           # ---------- 3) Harmonise and compute target-level max phase ----------
           tcol=next(c for c in ["targetId","target_id","target"] if c in kd.columns)
-          pcol=next(c for c in ["phase","clinicalPhase","maxPhaseForIndication","maximumClinicalTrialPhase","maxPhase"] if c in kd.columns)
-          kd[pcol]=pd.to_numeric(kd[pcol],errors="coerce")
-          phase=kd.dropna(subset=[tcol,pcol]).groupby(tcol,as_index=False)[pcol].max().rename(columns={tcol:"id",pcol:"max_phase"})
+          pcol=next(c for c in ["phase","clinicalPhase","clinicalStage","maxPhaseForIndication","maximumClinicalTrialPhase","maximumClinicalStage","maxPhase"] if c in kd.columns)
+          if pcol in ["clinicalStage","maximumClinicalStage"]:
+              def stage_rank(x):
+                  s=str(x).upper().replace(" ","_").replace("-","_")
+                  s=re.sub(r"_+","_",s)
+                  if any(k in s for k in ["APPROVAL","PHASE_IV","PHASEIV","WITHDRAWAL"]): return 4.0
+                  if "PREAPPROVAL" in s or "PRE_APPROVAL" in s: return 3.5
+                  if "PHASE_III" in s or "PHASEIII" in s: return 3.0
+                  if "PHASE_II_III" in s or "PHASEII_III" in s or "PHASEII/III" in s: return 2.5
+                  if "PHASE_II" in s or "PHASEII" in s: return 2.0
+                  if "PHASE_I_II" in s or "PHASEI_II" in s or "PHASEI/II" in s: return 1.5
+                  if "PHASE_I" in s or "PHASEI" in s: return 1.0
+                  if "EARLY_PHASE_I" in s or "EARLYPHASEI" in s or s=="IND": return 0.5
+                  return 0.0
+              kd["_phase_num"]=kd[pcol].map(stage_rank)
+              print("CLINICAL_STAGE_VALUES",kd[pcol].astype(str).value_counts().head(30).to_dict())
+              pnum="_phase_num"
+          else:
+              kd["_phase_num"]=pd.to_numeric(kd[pcol],errors="coerce")
+              pnum="_phase_num"
+          phase=kd.dropna(subset=[tcol,pnum]).groupby(tcol,as_index=False)[pnum].max().rename(columns={tcol:"id",pnum:"max_phase"})
           annot=targets.merge(phase,on="id",how="left")
           gene_annot=study.merge(annot[["id","approvedSymbol","max_phase"]],left_on="gene",right_on="approvedSymbol",how="left")
           gene_annot["max_phase"]=gene_annot["max_phase"].fillna(0.0)
