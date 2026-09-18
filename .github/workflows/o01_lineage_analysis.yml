@@ -1,0 +1,196 @@
+name: O01 lineage-matched cross-resource analysis
+
+on:
+  push:
+    branches:
+      - o01-lineage-scratch-20260919
+
+jobs:
+  lineage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl scipy
+      - name: Compute lineage-matched Broad-Sanger replication
+        shell: bash
+        run: |
+          cat > /tmp/lineage.py <<'PY'
+          import io, json, zipfile, re, itertools, math
+          from collections import defaultdict
+          import requests, pandas as pd, numpy as np
+          from scipy.stats import spearmanr, pearsonr, fisher_exact
+
+          UA={"User-Agent":"o01-lineage/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          BB="https://depmap.org/portal/breadbox"
+          DS="fa1b635a-5116-4a93-b66d-84eca7e2a402"
+          def get(url):
+              r=requests.get(url,headers=UA,timeout=240); r.raise_for_status(); return r
+          def post(url,payload):
+              r=requests.post(url,headers=UA,json=payload,timeout=240); r.raise_for_status(); return r
+
+          # Broad official common-essential-excluded gene universe and NextGen metadata
+          fig5_url=("https://media.springernature.com/original/springer-static/esm/"
+                    "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM12_ESM.xlsx")
+          fig5=pd.read_excel(io.BytesIO(get(fig5_url).content),sheet_name="Fig5b diff deps volcano")
+          universe=set(fig5["GeneSymbol"].dropna().astype(str).str.strip())
+
+          meta_url=("https://media.springernature.com/original/springer-static/esm/"
+                    "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM3_ESM.xlsx")
+          bmeta=pd.read_excel(io.BytesIO(get(meta_url).content),sheet_name="NextGen Model Metadata")
+          bmeta["Model ID"]=bmeta["Model ID"].astype(str)
+          has=bmeta["HasCRISPRData"].astype(str).str.lower().isin(["true","yes","1","y"])
+          # True organoid-format comparison: Dome only. Spheroid/adherent excluded.
+          bsel=bmeta[has & bmeta["Culture Format"].astype(str).str.lower().eq("dome")].copy()
+
+          map_groups={
+              "Bowel":"Bowel",
+              "Esophagus/Stomach":"UpperGI",
+              "Pancreas":"Pancreas",
+              "Ovary/Fallopian Tube":"Ovary",
+          }
+          bsel=bsel[bsel["Lineage"].isin(map_groups)].copy()
+          bsel["group"]=bsel["Lineage"].map(map_groups)
+
+          samples=get(f"{BB}/datasets/samples/{DS}").json()
+          screen_to_model={}
+          for s in samples:
+              lab=str(s.get("label",""))
+              m=re.match(r"(ACH-\d+)\s*\(",lab)
+              if m: screen_to_model[str(s["id"])]=m.group(1)
+          selected_models=set(bsel["Model ID"])
+          screen_ids=[sid for sid,mid in screen_to_model.items() if mid in selected_models]
+          model_to_group=dict(zip(bsel["Model ID"],bsel["group"]))
+
+          print("BROAD_DOME_CRISPR_MODELS",bsel.groupby("group")["Model ID"].nunique().to_dict())
+          print("BROAD_SELECTED_SCREENS",len(screen_ids))
+          print("BROAD_SCREEN_MODELS",len(set(screen_to_model[s] for s in screen_ids)))
+
+          # Get valid feature labels and restrict to Fig5 common-essential-excluded universe.
+          feats=get(f"{BB}/datasets/features/{DS}").json()
+          labels=set(str(x.get("label")) for x in feats)
+          genes=sorted(universe & labels)
+          print("BROAD_ANALYSIS_GENES",len(genes))
+
+          # Fetch only selected Broad Dome screens in gene chunks and average replicate screens at model grain.
+          broad_means={g:{} for g in map_groups.values()}
+          chunk=500
+          for st in range(0,len(genes),chunk):
+              gg=genes[st:st+chunk]
+              mat=post(f"{BB}/datasets/matrix/{DS}",{
+                  "features":gg,"feature_identifier":"label",
+                  "samples":screen_ids,"sample_identifier":"id"
+              }).json()
+              for gene,vmap in mat.items():
+                  if not isinstance(vmap,dict): continue
+                  bymodel=defaultdict(list)
+                  for sid,val in vmap.items():
+                      if val is None: continue
+                      mid=screen_to_model.get(str(sid))
+                      if mid in model_to_group:
+                          try:
+                              fv=float(val)
+                              if math.isfinite(fv): bymodel[mid].append(fv)
+                          except Exception: pass
+                  # collapse replicate/library screens per model first
+                  groupvals=defaultdict(list)
+                  for mid,vals in bymodel.items():
+                      if vals: groupvals[model_to_group[mid]].append(float(np.mean(vals)))
+                  for group,vals in groupvals.items():
+                      if vals: broad_means[group][gene]=float(np.mean(vals))
+              if st%2500==0: print("BROAD_FETCH_PROGRESS",st,len(genes))
+
+          # Sanger official supplementary data, independent models only.
+          surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
+                "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
+          z=zipfile.ZipFile(io.BytesIO(get(surl).content))
+          smeta=pd.read_excel(io.BytesIO(z.read("supplementary_table_2_revision.xlsx")),sheet_name="data_availability")
+          smeta["sample_ID"]=smeta["sample_ID"].astype(str)
+          scr=smeta[smeta["CRISPR_available"].astype(str).str.lower().eq("yes")].copy()
+          overlap=scr["overlap_Broad_DepMap"].astype(str).str.lower().isin(["yes","true","1"])
+          scr=scr[~overlap].copy()
+          def sgroup(x):
+              x=str(x)
+              if x=="Colorectal": return "Bowel"
+              if x in ["Oesophageal","Gastric"]: return "UpperGI"
+              if x=="Pancreatic": return "Pancreas"
+              if x=="Ovarian": return "Ovary"
+              return None
+          scr["group"]=scr["primary_tumour_type"].map(sgroup)
+          scr=scr[scr.group.notna()].copy()
+          print("SANGER_NONOVERLAP_MODELS",scr.groupby("group")["sample_ID"].nunique().to_dict())
+
+          t6=pd.read_csv(io.BytesIO(z.read("supplementary_table_6_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","LFC"])
+          t6["sample_ID"]=t6["sample_ID"].astype(str)
+          t6=t6[t6.sample_ID.isin(set(scr.sample_ID)) & t6.gene.astype(str).isin(universe)].copy()
+          pm=t6.groupby(["sample_ID","gene"],as_index=False).agg(LFC=("LFC","mean"))
+          pm=pm.merge(scr[["sample_ID","group"]],on="sample_ID",how="inner",validate="many_to_one")
+          ssum=pm.groupby(["group","gene"],as_index=False).agg(mean_LFC=("LFC","mean"))
+          sanger_means={g:dict(zip(x.gene.astype(str),x.mean_LFC.astype(float)))
+                        for g,x in ssum.groupby("group")}
+
+          groups=["Bowel","UpperGI","Pancreas","Ovary"]
+          matrix={}; detail={}
+          for bg in groups:
+              matrix[bg]={}
+              for sg in groups:
+                  common=sorted(set(broad_means[bg]) & set(sanger_means.get(sg,{})))
+                  x=np.array([broad_means[bg][g] for g in common],float)
+                  y=np.array([sanger_means[sg][g] for g in common],float)
+                  mask=np.isfinite(x)&np.isfinite(y); x=x[mask]; y=y[mask]
+                  rho,rp=spearmanr(x,y); pr,pp=pearsonr(x,y)
+                  # bottom10 rank overlap
+                  bx=x<=np.quantile(x,.10); sy=y<=np.quantile(y,.10)
+                  a=int((bx&sy).sum()); b=int(bx.sum()-a); c=int(sy.sum()-a); dd=int(len(x)-a-b-c)
+                  OR,fp=fisher_exact([[a,b],[c,dd]],alternative="greater")
+                  rec={"n":int(len(x)),"rho":float(rho),"rho_p":float(rp),
+                       "pearson":float(pr),"bottom10_overlap":a,
+                       "bottom10_broad":int(bx.sum()),"bottom10_sanger":int(sy.sum()),
+                       "bottom10_OR":float(OR),"bottom10_p":float(fp)}
+                  matrix[bg][sg]=float(rho); detail[f"{bg}__{sg}"]=rec
+
+          # Is the biologically canonical lineage matching stronger than arbitrary assignments?
+          obs=float(np.mean([matrix[g][g] for g in groups]))
+          perms=[]
+          for perm in itertools.permutations(groups):
+              score=float(np.mean([matrix[groups[i]][perm[i]] for i in range(len(groups))]))
+              perms.append({"perm":list(perm),"mean_rho":score})
+          perms=sorted(perms,key=lambda z:z["mean_rho"],reverse=True)
+          rank=1+sum(1 for z in perms if z["mean_rho"]>obs+1e-15)
+          exact_p=sum(1 for z in perms if z["mean_rho"]>=obs-1e-15)/len(perms)
+
+          # Matched-pair consensus candidates: bottom10 in both resources.
+          candidates={}
+          for g in groups:
+              common=sorted(set(broad_means[g]) & set(sanger_means[g]))
+              df=pd.DataFrame({"gene":common,
+                               "broad":[broad_means[g][x] for x in common],
+                               "sanger":[sanger_means[g][x] for x in common]})
+              df["b_pct"]=df["broad"].rank(pct=True,method="average")
+              df["s_pct"]=df["sanger"].rank(pct=True,method="average")
+              cc=df[(df.b_pct<=.10)&(df.s_pct<=.10)].copy()
+              cc["mean_pct"]=(cc.b_pct+cc.s_pct)/2
+              cc=cc.sort_values(["mean_pct","broad","sanger"])
+              candidates[g]=cc.head(25).to_dict("records")
+
+          out={
+              "broad_dome_crispr_models":bsel.groupby("group")["Model ID"].nunique().to_dict(),
+              "broad_selected_screens":len(screen_ids),
+              "sanger_nonoverlap_models":scr.groupby("group")["sample_ID"].nunique().to_dict(),
+              "gene_universe":len(genes),
+              "spearman_matrix":matrix,
+              "pair_details":detail,
+              "canonical_mean_rho":obs,
+              "canonical_assignment_rank_of_24":rank,
+              "assignment_exact_p":float(exact_p),
+              "top_assignments":perms[:5],
+              "matched_consensus_candidates":candidates
+          }
+          print("=== O01_LINEAGE_RESULT ===")
+          print(json.dumps(out,indent=2,default=str))
+          PY
+          python /tmp/lineage.py
