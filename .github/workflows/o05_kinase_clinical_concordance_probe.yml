@@ -1,0 +1,52 @@
+name: O05 kinase clinical concordance probe
+
+on:
+  push:
+    branches: [o05-kinase-clinical-concordance-20260919]
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install pandas openpyxl requests playwright
+          python -m playwright install --with-deps chromium
+      - name: Probe Nature supplement and CIViC release
+        shell: bash
+        run: |
+          python - <<'PY'
+          import io, json, re, asyncio, requests, pandas as pd
+          from playwright.async_api import async_playwright
+
+          H={"User-Agent":"Mozilla/5.0"}
+          supp="https://static-content.springer.com/esm/art%3A10.1038%2Fs41587-026-03090-8/MediaObjects/41587_2026_3090_MOESM4_ESM.xlsx"
+          r=requests.get(supp,headers=H,timeout=240); print("SUPP",r.status_code,len(r.content),r.headers.get("content-type")); r.raise_for_status()
+          xf=pd.ExcelFile(io.BytesIO(r.content))
+          print("SUPP_SHEETS",json.dumps(xf.sheet_names))
+          for sh in xf.sheet_names:
+              try:
+                  d=pd.read_excel(io.BytesIO(r.content),sheet_name=sh,nrows=8)
+                  print("SHEET",sh,"COLS",json.dumps([str(x) for x in d.columns[:120]]),"HEAD",d.head(3).to_json(orient="records",default_handler=str)[:8000])
+              except Exception as e: print("SHEET_ERR",sh,repr(e))
+
+          async def civic():
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context(user_agent=H["User-Agent"])
+                  pg=await ctx.new_page()
+                  await pg.goto("https://civicdb.org/releases",wait_until="networkidle",timeout=120000)
+                  links=await pg.locator("a").evaluate_all("""els=>els.map(e=>({text:(e.innerText||'').trim(),href:e.href||''}))""")
+                  cand=[x for x in links if re.search(r'tsv|vcf|release|download|evidence',json.dumps(x),re.I)]
+                  print("CIVIC_LINKS",json.dumps(cand[:300],indent=2)[:30000])
+                  # GraphQL schema snippets for evidence search.
+                  q='''query Introspect { __type(name:"EvidenceItem") { fields { name type { kind name ofType { kind name } } } } }'''
+                  rr=await ctx.request.post("https://civicdb.org/api/graphql",headers={"Content-Type":"application/json"},data=json.dumps({"query":q}),timeout=120000)
+                  print("GRAPHQL",rr.status,(await rr.text())[:20000])
+                  await b.close()
+          asyncio.run(civic())
+          PY
