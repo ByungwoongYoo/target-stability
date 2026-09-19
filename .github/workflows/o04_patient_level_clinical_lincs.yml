@@ -1,0 +1,256 @@
+name: O04 patient-level clinical LINCS pilot
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  patient_pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy scipy
+      - name: Run patient-level pilot
+        shell: bash
+        run: |
+          mkdir -p o04_patient
+          cat > /tmp/o04_patient.py <<'PY'
+          import requests,pandas as pd,numpy as np,re,json,io,time,gzip
+          from pathlib import Path
+          from scipy.stats import spearmanr, mannwhitneyu, binomtest, wilcoxon
+          import statsmodels.api as sm
+          import statsmodels.formula.api as smf
+
+          OUT=Path("o04_patient"); OUT.mkdir(exist_ok=True)
+          CDS="http://cdsdb.ncpsb.org.cn"
+          SIG="https://maayanlab.cloud/sigcom-lincs/metadata-api/signatures/find"
+          S=requests.Session(); S.headers.update({"User-Agent":"o04-patient/0.1"})
+
+          def norm(x): return re.sub(r'[^a-z0-9]','',str(x).lower())
+          def req(method,url,**kw):
+              last=None
+              for a in range(5):
+                  try:
+                      r=S.request(method,url,timeout=180,**kw)
+                      print("HTTP",method,url,r.status_code,len(r.content))
+                      if r.status_code<500:
+                          r.raise_for_status(); return r
+                      last=RuntimeError(f"{r.status_code} {r.text[:200]}")
+                  except Exception as e:
+                      last=e; print("HTTP_ERR",repr(e))
+                  time.sleep(2*(a+1))
+              raise last
+
+          # ---------- dataset metadata and strict response/nonresponse pairs ----------
+          meta=req("POST",CDS+"/cdsdb/browse/dataset",
+             headers={"Content-Type":"application/json","Accept":"application/json"},
+             json={"skip":0,"limit":500,"page":1,"filter":{},"sort":{}}).json()["data"]
+          byid={str(r.get("CDS-DB dataset ID")):r for r in meta}
+          pairs=[]; seen=set()
+          for r in meta:
+              rid=str(r.get("CDS-DB dataset ID","")); opp=str(r.get("CDS-DB dataset with the opposite response group","")).strip()
+              rg=str(r.get("Response group","")).strip().lower(); drugs=r.get("drugNames") or []
+              if rg not in {"response","non-response"} or not opp or opp not in byid or len(drugs)!=1: continue
+              o=byid[opp]; od=o.get("drugNames") or []; org=str(o.get("Response group","")).strip().lower()
+              if len(od)!=1 or norm(drugs[0])!=norm(od[0]) or {rg,org}!={"response","non-response"}: continue
+              key=tuple(sorted([rid,opp]))
+              if key in seen: continue
+              seen.add(key)
+              rr=r if rg=="response" else o; nn=o if rg=="response" else r
+              if norm(rr.get("Source dataset"))!=norm(nn.get("Source dataset")): continue
+              if norm(rr.get("Cancer subtype"))!=norm(nn.get("Cancer subtype")): continue
+              if norm(rr.get("Therapeutic regimen"))!=norm(nn.get("Therapeutic regimen")): continue
+              pairs.append({"drug":str(drugs[0]),"R_dataset":str(rr["CDS-DB dataset ID"]),"N_dataset":str(nn["CDS-DB dataset ID"]),
+                            "source":str(rr.get("Source dataset","")),"cancer":str(rr.get("Cancer subtype",""))})
+          print("STRICT_PAIRS",len(pairs))
+
+          # ---------- all patient metadata ----------
+          patient_rows=[]
+          for endpoint in ["/cdsdb/browse/patient","/cdsdb/browse/patientSignature"]:
+              try:
+                  obj=req("POST",CDS+endpoint,headers={"Content-Type":"application/json","Accept":"application/json"},
+                          json={"skip":0,"limit":5000,"page":1,"filter":{},"sort":{}}).json()
+                  cand=obj.get("data") if isinstance(obj,dict) else None
+                  print("PATIENT_ENDPOINT",endpoint,"TOTAL",obj.get("total") if isinstance(obj,dict) else None,"ROWS",len(cand or []))
+                  if cand:
+                      patient_rows=cand; break
+              except Exception as e: print("PATIENT_ENDPOINT_ERR",endpoint,repr(e))
+
+          # fallback: dataset rows sometimes include patient signature list.
+          if not patient_rows:
+              print("PATIENT_API_EMPTY_FALLBACK")
+              # query per dataset filter through patient endpoint
+              for p in pairs:
+                  for ds in [p["R_dataset"],p["N_dataset"]]:
+                      try:
+                          obj=req("POST",CDS+"/cdsdb/browse/patient",
+                              headers={"Content-Type":"application/json","Accept":"application/json"},
+                              json={"skip":0,"limit":1000,"page":1,"filter":{"CDS-DB dataset ID":ds},"sort":{}}).json()
+                          patient_rows.extend(obj.get("data") or [])
+                      except Exception as e: print("PATIENT_DS_ERR",ds,repr(e))
+
+          print("PATIENT_ROWS",len(patient_rows))
+          if patient_rows:
+              print("PATIENT_KEYS",json.dumps(sorted(patient_rows[0].keys()),ensure_ascii=False))
+              print("PATIENT_HEAD",json.dumps(patient_rows[:3],ensure_ascii=False)[:10000])
+
+          # discover field names robustly
+          def getv(r,*names):
+              for n in names:
+                  if n in r and r.get(n) not in (None,""): return r.get(n)
+              return None
+          patients_by_ds={}
+          for r in patient_rows:
+              ds=str(getv(r,"CDS-DB dataset ID","CDS dataset ID","datasetId","dataset_id") or "")
+              pid=str(getv(r,"CDS-DB patient signature ID","CDS patient signature ID","patientSignatureId","patient_signature_id") or "")
+              if ds and pid: patients_by_ds.setdefault(ds,[]).append(pid)
+          print("PATIENT_DATASETS_MAPPED",len(patients_by_ds))
+
+          # If no direct mapping, parse dataset metadata list.
+          for ds,row in byid.items():
+              if ds in patients_by_ds: continue
+              v=row.get("CDS patient signature list") or row.get("CDS-DB patient signature list associated with the CDS-DB dataset signature")
+              vals=[]
+              if isinstance(v,list): vals=[str(x) for x in v]
+              elif isinstance(v,str): vals=re.findall(r'CDS_patient_signature_\d+',v)
+              if vals: patients_by_ds[ds]=vals
+
+          target_ds={p["R_dataset"] for p in pairs}|{p["N_dataset"] for p in pairs}
+          print("TARGET_DS_WITH_PATIENTS",sum(ds in patients_by_ds for ds in target_ds),"OF",len(target_ds))
+
+          # ---------- patient signature fetch ----------
+          pcache={}
+          def patient_profile(pid):
+              if pid in pcache: return pcache[pid]
+              # patient-level has no cohort test; ask for effectively unfiltered/top display.
+              obj=req("POST",CDS+"/cdsdb/analysisResults",
+                  headers={"Content-Type":"application/json","Accept":"application/json"},
+                  json={"jobId":pid,"level":"raw/patient","logFC":1e-9,"pValue":1.0}).json()
+              tab=((obj.get("results") or {}).get("deg") or {}).get("tableData") or []
+              d=pd.DataFrame(tab)
+              print("PATIENT_PROFILE",pid,"ROWS",len(d),"COLS",list(d.columns)[:20])
+              if d.empty or "Gene symbol" not in d or "LogFC" not in d:
+                  pcache[pid]=None; return None
+              d["coef"]=pd.to_numeric(d["LogFC"],errors="coerce")
+              d["gene"]=d["Gene symbol"].astype(str).str.upper().str.strip()
+              d=d.dropna(subset=["coef"]).copy()
+              d["abs"]=d.coef.abs()
+              d=d.sort_values("abs",ascending=False).drop_duplicates("gene").head(500)
+              pcache[pid]=d[["gene","coef"]]; return pcache[pid]
+
+          # ---------- LINCS profiles ----------
+          lcache={}
+          def lincs_profiles(drug):
+              if drug in lcache:return lcache[drug]
+              arr=req("POST",SIG,json={"filter":{"where":{"meta.pert_name":drug.lower()},"limit":100}}).json()
+              prof=[]
+              for x in arr:
+                  m=x.get("meta",{}); u=m.get("persistent_id")
+                  if str(m.get("pert_type","")).lower()!="chemical" or not u: continue
+                  try:
+                      rr=req("GET",u); data=rr.content
+                      if data[:2]==b"\x1f\x8b" or u.endswith(".gz"): data=gzip.decompress(data)
+                      d=pd.read_csv(io.BytesIO(data),sep="\t")
+                      # Support single-context and mean-signature layouts.
+                      if "symbol" in d.columns and "CD-coefficient" in d.columns:
+                          sym,score="symbol","CD-coefficient"
+                      elif len(d.columns)>=2:
+                          sym,score=d.columns[0],d.columns[1]
+                      else: continue
+                      d["gene"]=d[sym].astype(str).str.upper().str.strip()
+                      d["coef"]=pd.to_numeric(d[score],errors="coerce")
+                      d=d.dropna(subset=["coef"]).drop_duplicates("gene")
+                      if len(d)<1000: continue
+                      prof.append({"id":x.get("id"),"cell":m.get("cell_line"),"time":m.get("pert_time"),"dose":m.get("pert_dose"),
+                                   "mean":not bool(m.get("cell_line")),"coef":d[["gene","coef"]]})
+                  except Exception as e: print("LINCS_FILE_ERR",drug,repr(e))
+              lcache[drug]=prof
+              print("LINCS_PROFILES",drug,len(prof),"MEANS",sum(x["mean"] for x in prof))
+              return prof
+
+          def patient_lincs_score(p,profs):
+              vals=[]; dirvals=[]
+              for x in profs:
+                  z=p.merge(x["coef"],on="gene",suffixes=("_p","_l"))
+                  if len(z)<100: continue
+                  rho=float(spearmanr(z.coef_p,z.coef_l).statistic)
+                  if not np.isfinite(rho): continue
+                  agree=float(np.mean(np.sign(z.coef_p)==np.sign(z.coef_l)))
+                  vals.append(rho); dirvals.append(agree)
+              if not vals:return None
+              return {"n_profiles":len(vals),"median_rho":float(np.median(vals)),"max_rho":float(np.max(vals)),
+                      "q90_rho":float(np.quantile(vals,.9)),"median_agreement":float(np.median(dirvals))}
+
+          # ---------- score patients ----------
+          recs=[]; cohort_summ=[]
+          for p in sorted(pairs,key=lambda z:(z["drug"].lower(),z["source"],z["R_dataset"])):
+              profs=lincs_profiles(p["drug"])
+              if not profs: continue
+              rr=[]; nn=[]
+              for label,ds,out in [("R",p["R_dataset"],rr),("N",p["N_dataset"],nn)]:
+                  ids=patients_by_ds.get(ds,[])
+                  print("COHORT",p["drug"],p["source"],label,ds,"PATIENT_IDS",len(ids))
+                  for pid in ids:
+                      try:
+                          pp=patient_profile(pid)
+                          if pp is None: continue
+                          sc=patient_lincs_score(pp,profs)
+                          if sc:
+                              row={**p,"response":1 if label=="R" else 0,"patient_sig_id":pid,**sc}
+                              recs.append(row); out.append(row)
+                      except Exception as e: print("PATIENT_ERR",pid,repr(e))
+              if rr and nn:
+                  rv=np.array([x["median_rho"] for x in rr]); nv=np.array([x["median_rho"] for x in nn])
+                  try: mw=mannwhitneyu(rv,nv,alternative="two-sided")
+                  except: mw=None
+                  cohort_summ.append({**p,"n_R":len(rv),"n_N":len(nv),"median_R":float(np.median(rv)),"median_N":float(np.median(nv)),
+                                      "delta_median":float(np.median(rv)-np.median(nv)),
+                                      "mw_p":float(mw.pvalue) if mw else None})
+          print("PATIENT_SCORED",len(recs),"COHORTS_COMPLETE",len(cohort_summ))
+
+          # ---------- overall within-study fixed-effect regression ----------
+          overall={}
+          rdf=pd.DataFrame(recs)
+          if not rdf.empty and rdf.response.nunique()==2:
+              rdf["study"]=rdf["source"].astype(str)+"|"+rdf["drug"].astype(str)+"|"+rdf["cancer"].astype(str)
+              keep=rdf.groupby("study").response.nunique()
+              valid=keep[keep==2].index
+              mdf=rdf[rdf.study.isin(valid)].copy()
+              overall["n_patients"]=int(len(mdf)); overall["n_studies"]=int(mdf.study.nunique())
+              if len(mdf)>=10 and mdf.response.nunique()==2:
+                  try:
+                      mod=smf.ols("median_rho ~ response + C(study)",data=mdf).fit(cov_type="HC3")
+                      overall["beta_response"]=float(mod.params["response"])
+                      overall["CI95_response"]=[float(x) for x in mod.conf_int().loc["response"].tolist()]
+                      overall["p_response"]=float(mod.pvalues["response"])
+                  except Exception as e: overall["reg_error"]=repr(e)
+
+          deltas=np.array([x["delta_median"] for x in cohort_summ],float)
+          if len(deltas):
+              pos=int((deltas>0).sum()); neg=int((deltas<0).sum())
+              overall["cohort_delta_median"]=float(np.median(deltas))
+              overall["cohort_positive"]=pos; overall["cohort_negative"]=neg
+              if pos+neg: overall["cohort_sign_p"]=float(binomtest(pos,pos+neg,.5).pvalue)
+              if len(deltas)>=2:
+                  try: overall["cohort_wilcoxon_p"]=float(wilcoxon(deltas).pvalue)
+                  except Exception as e: overall["cohort_wilcoxon_error"]=repr(e)
+
+          result={"strict_pairs":len(pairs),"patient_rows_metadata":len(patient_rows),"patients_scored":len(recs),
+                  "complete_cohorts":len(cohort_summ),"overall":overall,"cohorts":cohort_summ}
+          print("=== O04_PATIENT_LEVEL_RESULT ===")
+          print(json.dumps(result,indent=2,ensure_ascii=False))
+          (OUT/"result.json").write_text(json.dumps(result,indent=2,ensure_ascii=False),encoding="utf-8")
+          (OUT/"patients.json").write_text(json.dumps(recs,indent=2,ensure_ascii=False),encoding="utf-8")
+          PY
+          python /tmp/o04_patient.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o04-patient-level
+          path: o04_patient/
+          retention-days: 5
