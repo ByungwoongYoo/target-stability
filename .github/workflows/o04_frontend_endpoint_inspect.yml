@@ -1,0 +1,43 @@
+name: O04 frontend endpoint inspect
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests
+      - name: Inspect CDS-DB analysis frontend endpoints
+        run: |
+          python - <<'PY'
+          import requests,re,json
+          base="http://cdsdb.ncpsb.org.cn"
+          urls=[
+            base+"/js/chunk-6d0feeba.5291b3a5.js",
+            base+"/js/chunk-264834f8.267e971e.js",
+            base+"/js/chunk-1107a395.261b769c.js",
+            base+"/js/app.bcc4b75f.js"
+          ]
+          for u in urls:
+              r=requests.get(u,headers={"User-Agent":"Mozilla/5.0"},timeout=90)
+              print("URL",u,r.status_code,len(r.content))
+              txt=r.text
+              pats=sorted(set(re.findall(r'["\']([^"\']*(?:download|analysis|signature|profile|result|file)[^"\']*)["\']',txt,re.I)))
+              print("MATCHES",json.dumps(pats[:500],ensure_ascii=False,indent=2))
+              # context around apiFlask / analysisResults / getFile / download
+              for key in ["apiFlask","analysisResults","downloadData","download","signature","profile"]:
+                  pos=0
+                  while True:
+                      i=txt.find(key,pos)
+                      if i<0: break
+                      print("CTX",key,txt[max(0,i-500):i+1000])
+                      pos=i+len(key)
+          PY
