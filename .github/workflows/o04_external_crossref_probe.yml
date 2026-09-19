@@ -1,0 +1,24 @@
+name: O04 external crossref probe
+on:
+  push:
+    branches: [o04-proteomic-therapeutic-window-20260919]
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install pandas openpyxl requests
+      - shell: bash
+        run: |
+          python - <<'PY'
+          import io,requests,pandas as pd,json
+          u="https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41586-026-10660-y/MediaObjects/41586_2026_10660_MOESM9_ESM.xlsx"
+          r=requests.get(u,timeout=240,headers={"User-Agent":"Mozilla/5.0"}); print("DL",r.status_code,len(r.content)); r.raise_for_status()
+          xf=pd.ExcelFile(io.BytesIO(r.content)); print("SHEETS",json.dumps(xf.sheet_names))
+          for sh in xf.sheet_names:
+              d=pd.read_excel(io.BytesIO(r.content),sheet_name=sh,nrows=5)
+              print("HDR",sh,json.dumps([str(x) for x in d.columns[:200]]))
+              print("HEAD",sh,d.to_json(orient="records",default_handler=str)[:12000])
+          PY
