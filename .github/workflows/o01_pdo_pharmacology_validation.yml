@@ -1,0 +1,353 @@
+name: O01 independent PDO pharmacology validation
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  pdo_pharm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install requests pandas openpyxl scipy pyarrow playwright
+          python -m playwright install --with-deps chromium
+      - name: Run independent PDO pharmacology validation
+        shell: bash
+        run: |
+          cat > /tmp/o01_pdo_pharm.py <<'PY'
+          import io,json,zipfile,time,re,urllib.parse,xml.etree.ElementTree as ET, asyncio
+          import numpy as np, pandas as pd, requests, pyarrow.parquet as pq
+          from scipy.stats import spearmanr, mannwhitneyu, fisher_exact
+          from playwright.async_api import async_playwright
+
+          BB="https://depmap.org/portal/breadbox"
+          DSID="fa1b635a-5116-4a93-b66d-84eca7e2a402"
+          S3="https://open-targets-public-data-releases.s3.amazonaws.com/"
+          NS={"s3":"http://s3.amazonaws.com/doc/2006-03-01/"}
+          H={"User-Agent":"o01-pdo-pharm/0.1 (+https://github.com/ByungwoongYoo/target-stability)","Accept":"application/json"}
+
+          def req(method,url,**kw):
+              h=H.copy(); h.update(kw.pop("headers",{})); err=None
+              for a in range(7):
+                  try:
+                      r=requests.request(method,url,headers=h,timeout=240,**kw)
+                      if r.status_code<500:
+                          r.raise_for_status(); return r
+                      err=RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+                  except Exception as e: err=e
+                  time.sleep(2*(a+1))
+              raise err
+          def bget(ep): return req("GET",BB+"/"+ep.lstrip("/")).json()
+          def bpost(ep,body): return req("POST",BB+"/"+ep.lstrip("/"),json=body).json()
+
+          def frame(raw):
+              ids=set()
+              for v in raw.values():
+                  if isinstance(v,dict): ids.update(map(str,v.keys()))
+              rows=[]
+              for i in sorted(ids):
+                  row={"screen_id":i}
+                  for k,v in raw.items():
+                      if isinstance(v,dict): row[k]=v.get(i)
+                  rows.append(row)
+              return pd.DataFrame(rows)
+          def truth(s): return s.astype(str).str.lower().isin(["true","yes","1","y"])
+
+          # 1) Reproduce definitive q10 filtered CRC gene classes.
+          md=frame(bpost("datasets/tabular/screen_nextgen_metadata",{"columns":[
+              "OncotreeLineage","IsNextGen","IsAdherent2D","ScreenType"
+          ]}))
+          matrix_ids=set(str(x["id"]) for x in bget(f"datasets/samples/{DSID}"))
+          md=md[md.screen_id.astype(str).isin(matrix_ids)].copy()
+          crc=md.OncotreeLineage.astype(str).str.lower().str.contains(r"colorectal|colon|rect|bowel",regex=True)
+          broad3=md[crc & truth(md.IsNextGen) & md.ScreenType.astype(str).eq("3DO")]
+          broad2=md[crc & truth(md.IsAdherent2D)]
+          features=bget(f"datasets/features/{DSID}")
+          fmap={str(x["id"]):str(x["label"]) for x in features}
+
+          def agg(ids,name):
+              o=bpost(f"datasets/matrix/{DSID}",{
+                  "sample_identifier":"id","samples":sorted(set(map(str,ids))),
+                  "aggregate":{"aggregate_by":"samples","aggregation":"mean"}})
+              return pd.DataFrame({"gene":[fmap.get(str(k),str(k)) for k in o["mean"]],
+                                   name:list(o["mean"].values())})
+          b3=agg(broad3.screen_id,"BroadCRC3D")
+          b2=agg(broad2.screen_id,"BroadCRC2D")
+
+          figurl=("https://media.springernature.com/original/springer-static/esm/"
+                  "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM12_ESM.xlsx")
+          fig=pd.read_excel(io.BytesIO(req("GET",figurl).content),sheet_name="Fig5b diff deps volcano")
+          allowed=set(fig.GeneSymbol.dropna().astype(str).str.strip())
+          b3=b3[b3.gene.astype(str).isin(allowed)]
+          b2=b2[b2.gene.astype(str).isin(allowed)]
+
+          surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
+                "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
+          z=zipfile.ZipFile(io.BytesIO(req("GET",surl).content))
+          smeta=pd.read_excel(io.BytesIO(z.read("supplementary_table_2_revision.xlsx")),sheet_name="data_availability")
+          t6=pd.read_csv(io.BytesIO(z.read("supplementary_table_6_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","LFC"])
+          smeta["sample_ID"]=smeta.sample_ID.astype(str)
+          scr=smeta[smeta.CRISPR_available.astype(str).str.lower().eq("yes")]
+          keep=set(scr.loc[
+              scr.primary_tumour_type.astype(str).str.lower().eq("colorectal") &
+              ~scr.overlap_Broad_DepMap.astype(str).str.lower().isin(["yes","true","1"]),
+              "sample_ID"].astype(str))
+          t6["sample_ID"]=t6.sample_ID.astype(str)
+          sg=(t6[t6.sample_ID.isin(keep)].groupby(["sample_ID","gene"],as_index=False).agg(LFC=("LFC","mean"))
+              .groupby("gene",as_index=False).agg(SangerCRC3D=("LFC","mean")))
+          dep=b3.merge(b2,on="gene").merge(sg,on="gene").dropna().copy()
+          for c in ["BroadCRC3D","BroadCRC2D","SangerCRC3D"]: dep[c]=pd.to_numeric(dep[c],errors="coerce")
+          dep=dep.dropna()
+          q=.10
+          dep["b3"]=dep.BroadCRC3D<=dep.BroadCRC3D.quantile(q)
+          dep["s3"]=dep.SangerCRC3D<=dep.SangerCRC3D.quantile(q)
+          dep["b2"]=dep.BroadCRC2D<=dep.BroadCRC2D.quantile(q)
+          dep["subclass"]=np.select(
+              [dep.b2&dep.b3&dep.s3, ~dep.b2&dep.b3&dep.s3, dep.b2&~dep.b3&~dep.s3],
+              ["UNIVERSAL_2D_BOTH3D","THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY"],default="OTHER")
+          print("DEP_UNIVERSE",len(dep),"Q10",dep.subclass.value_counts().to_dict())
+
+          # 2) Recover Mendeley Data S5 through same-origin browser session.
+          async def get_s5():
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36")
+                  pg=await ctx.new_page()
+                  await pg.goto("https://data.mendeley.com/datasets/hr94h42xdc/3",wait_until="domcontentloaded",timeout=120000)
+                  await pg.wait_for_timeout(2500)
+                  api="https://data.mendeley.com/public-api/datasets/hr94h42xdc/files?folder_id=root&version=3"
+                  rr=await pg.evaluate("""async u=>{let r=await fetch(u,{credentials:'include'}); return {s:r.status,t:await r.text()}}""",api)
+                  if rr["s"]!=200: raise RuntimeError(f"Mendeley API {rr['s']}")
+                  files=json.loads(rr["t"])
+                  f=next(x for x in files if str(x.get("filename","")).lower()=="data s5.xlsx")
+                  u=(f.get("content_details") or {}).get("download_url")
+                  r=await ctx.request.get(u,timeout=120000)
+                  body=await r.body()
+                  print("S5_DOWNLOAD",r.status,len(body),f.get("filename"))
+                  await b.close()
+                  return body
+          s5_bytes=asyncio.run(get_s5())
+          s5=pd.read_excel(io.BytesIO(s5_bytes))
+          print("S5_SHAPE",s5.shape)
+
+          # Harmonise raw column labels into a single response vector per compound.
+          def norm(s):
+              return re.sub(r"[^a-z0-9]","",str(s).lower())
+          meta_cols={"sample_id","run_id_harmonize","run_id_lib1","run_id_lib2"}
+          drug_cols=[c for c in s5.columns if c not in meta_cols]
+          by_drug={}
+          skip_combo={"fliri","flox","flv","mapk3x","5fugemcitabine","volasertibsn38"}
+          for c in drug_cols:
+              base=re.sub(r"_lib[12]$","",str(c),flags=re.I)
+              nb=norm(base)
+              if nb in skip_combo or "&" in base: continue
+              by_drug.setdefault(base,[]).append(c)
+          # Merge library-specific duplicates at sample level then summarize across PDOs.
+          resp=[]
+          for name,cols in by_drug.items():
+              vals=s5[cols].apply(pd.to_numeric,errors="coerce")
+              v=vals.mean(axis=1,skipna=True)
+              v=v[v.notna()]
+              if len(v):
+                  resp.append({"drug_label":name,"drug_norm":norm(name),"n_pdo":int(v.size),
+                               "median_DSS":float(v.median()),"mean_DSS":float(v.mean()),
+                               "q25_DSS":float(v.quantile(.25)),"q75_DSS":float(v.quantile(.75))})
+          resp=pd.DataFrame(resp)
+          print("DSS_DRUGS",len(resp))
+          print("DSS_SUMMARY",resp.sort_values("median_DSS",ascending=False).to_json(orient="records"))
+
+          # 3) Open Targets 26.06 drug names + mechanisms.
+          def list_keys(prefix):
+              ks=[]; token=None
+              while True:
+                  params={"list-type":"2","prefix":prefix,"max-keys":"1000"}
+                  if token: params["continuation-token"]=token
+                  root=ET.fromstring(req("GET",S3,params=params).content)
+                  ks += [x.find("s3:Key",NS).text for x in root.findall("s3:Contents",NS)]
+                  if root.findtext("s3:IsTruncated",default="false",namespaces=NS)!="true": break
+                  token=root.findtext("s3:NextContinuationToken",default=None,namespaces=NS)
+              return ks
+          def read_ot(name,wanted=None):
+              fs=[]; schema=None
+              for k in [x for x in list_keys(f"platform/26.06/output/{name}/") if x.endswith(".parquet")]:
+                  tab=pq.read_table(io.BytesIO(req("GET",S3+urllib.parse.quote(k,safe="/")).content))
+                  if schema is None: schema=tab.schema.names
+                  cols=[c for c in (wanted or tab.schema.names) if c in tab.schema.names]
+                  fs.append(tab.select(cols).to_pandas())
+              return pd.concat(fs,ignore_index=True),schema
+
+          drugs,drug_schema=read_ot("drug",["id","name","synonyms","tradeNames"])
+          moa,moa_schema=read_ot("mechanism_of_action",None)
+          targets,_=read_ot("target",["id","approvedSymbol"])
+          tmap=dict(zip(targets.id.astype(str),targets.approvedSymbol.astype(str)))
+          print("DRUG_SCHEMA",drug_schema)
+          print("MOA_SCHEMA",moa_schema)
+          print("MOA_ROWS",len(moa))
+
+          # Name index. Discard ambiguous aliases that resolve to >1 ChEMBL ID.
+          alias={}
+          def labels(v):
+              out=[]
+              if isinstance(v,(list,tuple,np.ndarray)):
+                  for x in v:
+                      if isinstance(x,dict) and x.get("label"): out.append(str(x["label"]))
+                      elif x is not None: out.append(str(x))
+              return out
+          for _,r in drugs.iterrows():
+              ls=[str(r.get("name",""))]+labels(r.get("synonyms"))+labels(r.get("tradeNames"))
+              for lab in ls:
+                  n=norm(lab)
+                  if n: alias.setdefault(n,set()).add(str(r["id"]))
+          manual={"5fu":"fluorouracil","sn38":"sn38","bms754807":"bms754807",
+                  "azd7762":"azd7762","lgk974":"wnt974","tas102":"trifluridinetipiracil"}
+          drug_match=[]
+          for _,r in resp.iterrows():
+              n=r.drug_norm
+              ids=alias.get(n,set())
+              if len(ids)!=1 and n in manual: ids=alias.get(norm(manual[n]),set())
+              if len(ids)==1:
+                  drug_match.append({"drug_label":r.drug_label,"chemblId":next(iter(ids))})
+          dm=pd.DataFrame(drug_match)
+          print("DRUG_MATCH_N",len(dm),"OF",len(resp))
+          print("DRUG_MATCH",dm.to_json(orient="records"))
+
+          # Flatten mechanism rows robustly.
+          flat=[]
+          if "chemblId" in moa.columns and "rows" in moa.columns:
+              for _,r in moa.iterrows():
+                  cid=str(r["chemblId"])
+                  rows=r["rows"]
+                  if not isinstance(rows,(list,tuple,np.ndarray)): continue
+                  for x in rows:
+                      if not isinstance(x,dict): continue
+                      tids=x.get("targets") or []
+                      act=x.get("actionType")
+                      mech=x.get("mechanismOfAction")
+                      for tid in tids:
+                          flat.append({"chemblId":cid,"targetId":str(tid),"actionType":act,"mechanism":mech})
+          else:
+              # fallback for a flat table
+              cid_col=next((c for c in ["chemblId","drugId","id"] if c in moa.columns),None)
+              targ_col=next((c for c in ["targets","targetId"] if c in moa.columns),None)
+              act_col=next((c for c in ["actionType","action_type"] if c in moa.columns),None)
+              for _,r in moa.iterrows():
+                  tids=r.get(targ_col) if targ_col else []
+                  if not isinstance(tids,(list,tuple,np.ndarray)): tids=[tids] if pd.notna(tids) else []
+                  for tid in tids:
+                      flat.append({"chemblId":str(r[cid_col]),"targetId":str(tid),
+                                   "actionType":r.get(act_col) if act_col else None,"mechanism":None})
+          mf=pd.DataFrame(flat)
+          if len(mf)==0: raise RuntimeError("No mechanism rows parsed")
+          mf["gene"]=mf.targetId.map(tmap)
+          mf=mf[mf.gene.notna()].copy()
+          mf["action"]=mf.actionType.astype(str).str.upper()
+          negative=mf.action.str.contains(r"INHIB|ANTAGON|BLOCK|DEGRAD|NEGATIVE|SUPPRESS|DISRUPT",regex=True)
+          mf=mf[negative].copy()
+          print("NEGATIVE_MOA_ROWS",len(mf),"ACTION_TYPES",mf.action.value_counts().to_dict())
+
+          # Direct-inhibitory union of targets per mapped drug.
+          m=dm.merge(mf,on="chemblId",how="inner").merge(resp,on="drug_label",how="inner")
+          # De-duplicate drug-target pairs
+          m=m.drop_duplicates(["drug_label","chemblId","gene"])
+          nt=m.groupby(["drug_label","chemblId"],as_index=False).agg(n_targets=("gene","nunique"))
+          m=m.merge(nt,on=["drug_label","chemblId"],how="left")
+          print("MAPPED_DRUG_TARGET_PAIRS",len(m),"DRUGS",m.drug_label.nunique())
+          print("MAPPED_PAIRS",m.sort_values(["drug_label","gene"]).to_json(orient="records"))
+
+          # Primary: only compounds whose inhibitory OT mechanism maps to one human gene.
+          pri=m[m.n_targets.eq(1)].copy()
+          pri_gene=(pri.groupby("gene",as_index=False)
+                    .agg(drug_n=("drug_label","nunique"),
+                         median_DSS=("median_DSS","median"),
+                         mean_DSS=("median_DSS","mean"),
+                         pdo_n_median=("n_pdo","median"),
+                         drugs=("drug_label",lambda x:";".join(sorted(set(x))))))
+          pri_gene=pri_gene.merge(dep,on="gene",how="inner")
+          print("PRIMARY_GENES_N",len(pri_gene))
+          print("PRIMARY_GENE_TABLE",pri_gene.sort_values("median_DSS",ascending=False).to_json(orient="records"))
+
+          # Secondary: all inhibitory mechanisms, multi-target included, collapsed per target gene.
+          sec_gene=(m.groupby("gene",as_index=False)
+                    .agg(drug_n=("drug_label","nunique"),
+                         median_DSS=("median_DSS","median"),
+                         mean_DSS=("median_DSS","mean"),
+                         pdo_n_median=("n_pdo","median"),
+                         drugs=("drug_label",lambda x:";".join(sorted(set(x))))))
+          sec_gene=sec_gene.merge(dep,on="gene",how="inner")
+
+          rng=np.random.default_rng(20260919)
+          def corr_summary(g,label):
+              out={"label":label,"n_genes":int(len(g))}
+              for col in ["BroadCRC3D","BroadCRC2D","SangerCRC3D"]:
+                  rr,pp=spearmanr(-g[col],g.median_DSS)
+                  out[col]={"rho":float(rr),"p":float(pp)}
+              # bootstrap paired delta Broad 3D minus Broad 2D
+              ds=[]
+              if len(g)>=5:
+                  for _ in range(5000):
+                      idx=rng.integers(0,len(g),len(g))
+                      x=g.iloc[idx]
+                      r3=spearmanr(-x.BroadCRC3D,x.median_DSS).statistic
+                      r2=spearmanr(-x.BroadCRC2D,x.median_DSS).statistic
+                      if np.isfinite(r3) and np.isfinite(r2): ds.append(r3-r2)
+              if ds:
+                  out["delta_rho_3D_minus_2D"]=float(np.mean(ds))
+                  out["delta_bootstrap95"]=[float(x) for x in np.quantile(ds,[.025,.975])]
+              return out
+
+          def class_tests(g,label):
+              out={"label":label,"class_counts":g.subclass.value_counts().to_dict(),"tests":[]}
+              # target-level DSS; higher = more sensitive
+              for A,B in [("THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY"),
+                          ("UNIVERSAL_2D_BOTH3D","TWO_D_ONLY")]:
+                  a=g[g.subclass.eq(A)].median_DSS
+                  b=g[g.subclass.eq(B)].median_DSS
+                  rec={"a":A,"b":B,"a_n":int(len(a)),"b_n":int(len(b)),
+                       "a_median":float(a.median()) if len(a) else None,
+                       "b_median":float(b.median()) if len(b) else None}
+                  if len(a) and len(b):
+                      U,p=mannwhitneyu(a,b,alternative="two-sided")
+                      rec.update({"U":float(U),"p":float(p)})
+                  out["tests"].append(rec)
+              # top-quartile pharmacologic activity among mapped genes.
+              if len(g):
+                  cut=float(g.median_DSS.quantile(.75))
+                  gg=g.copy(); gg["high_DSS"]=gg.median_DSS>=cut
+                  out["top_quartile_cut"]=cut
+                  for A,B in [("THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY"),
+                              ("UNIVERSAL_2D_BOTH3D","TWO_D_ONLY")]:
+                      a=gg[gg.subclass.eq(A)]; b=gg[gg.subclass.eq(B)]
+                      ae=int(a.high_DSS.sum()); be=int(b.high_DSS.sum())
+                      if len(a) and len(b):
+                          OR,p=fisher_exact([[ae,len(a)-ae],[be,len(b)-be]],alternative="two-sided")
+                          out["tests"].append({"endpoint":"top_quartile_DSS","a":A,"b":B,
+                                              "a_n":len(a),"a_event":ae,"b_n":len(b),"b_event":be,
+                                              "OR":float(OR),"p":float(p)})
+              return out
+
+          result={
+              "data":{"pdo_rows":int(len(s5)),"dss_drugs":int(len(resp)),
+                      "matched_ot_drugs":int(dm.drug_label.nunique()),
+                      "inhibitory_mapped_drugs":int(m.drug_label.nunique()),
+                      "primary_single_target_genes":int(len(pri_gene)),
+                      "secondary_all_target_genes":int(len(sec_gene))},
+              "primary_correlations":corr_summary(pri_gene,"single-target inhibitory drugs"),
+              "secondary_correlations":corr_summary(sec_gene,"all inhibitory mechanisms target-collapsed"),
+              "primary_classes":class_tests(pri_gene,"single-target inhibitory drugs"),
+              "secondary_classes":class_tests(sec_gene,"all inhibitory mechanisms target-collapsed"),
+              "primary_genes":pri_gene[["gene","subclass","median_DSS","drug_n","drugs",
+                                        "BroadCRC3D","BroadCRC2D","SangerCRC3D"]].sort_values("median_DSS",ascending=False).to_dict("records"),
+              "secondary_genes":sec_gene[["gene","subclass","median_DSS","drug_n","drugs",
+                                          "BroadCRC3D","BroadCRC2D","SangerCRC3D"]].sort_values("median_DSS",ascending=False).to_dict("records")
+          }
+          print("=== O01_PDO_PHARM_RESULT ===")
+          print(json.dumps(result,indent=2,default=str))
+          PY
+          python /tmp/o01_pdo_pharm.py
