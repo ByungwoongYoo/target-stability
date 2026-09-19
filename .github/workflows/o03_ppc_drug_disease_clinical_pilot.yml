@@ -204,31 +204,24 @@ jobs:
               if len(ids)==1:ppc_to_chembl[str(r.short_name)]=next(iter(ids))
           print("OT_DRUG_MAP",len(ppc_to_chembl),"OF",dd.short_name.nunique())
 
-          # OncoTree public API -> NCIt IDs
+          # OncoTree -> NCIt using the cBioPortal static mapping table.
+          # This is more complete and avoids per-code API calls.
           codes=sorted(set(str(x) for x in bias.oncotree_code.dropna().unique()))
-          code_ncit={}
-          for code in codes:
-              urls=[
-                f"https://oncotree.mskcc.org/api/tumorTypes/code/{code}",
-                f"https://oncotree.mskcc.org/api/tumorTypes/{code}"
-              ]
-              obj=None
-              for u in urls:
-                  try:
-                      rr=req(u)
-                      if "json" in rr.headers.get("content-type",""):
-                          obj=rr.json();break
-                  except:pass
-              if isinstance(obj,dict):
-                  vals=[]
-                  for k in ["nci","nciCode","nci_code","nciThesaurusCode"]:
-                      v=obj.get(k)
-                      if isinstance(v,str):vals.append(v)
-                      elif isinstance(v,list):vals += [str(t) for t in v]
-                  vals += [str(v) for k,v in obj.items() if "nci" in str(k).lower() and isinstance(v,str)]
-                  vals=[v for v in vals if re.search(r"C\d+",v)]
-                  if vals:code_ncit[code]=re.search(r"C\d+",vals[0]).group(0)
-          print("ONCOTREE_NCIT_MAP",len(code_ncit),"OF",len(codes),json.dumps(list(code_ncit.items())[:20]))
+          map_url=("https://raw.githubusercontent.com/cBioPortal/oncotree/master/"
+                   "scripts/ontology_to_ontology_mapping_tool/ontology_mappings.txt")
+          map_txt=req(map_url).text
+          mt=pd.read_csv(io.StringIO(map_txt),sep="\t",dtype=str).fillna("")
+          code_ncit_multi={}
+          for _,mr in mt.iterrows():
+              code=str(mr.get("ONCOTREE_CODE","")).strip()
+              if not code: continue
+              vals=[x.strip() for x in str(mr.get("NCIT_CODE","")).split(",") if re.fullmatch(r"C\d+",x.strip())]
+              if vals: code_ncit_multi[code]=vals
+          # Keep only unambiguous single-NCIt mappings for the primary pilot.
+          code_ncit={code:vals[0] for code,vals in code_ncit_multi.items() if code in codes and len(vals)==1}
+          ambiguous={code:vals for code,vals in code_ncit_multi.items() if code in codes and len(vals)>1}
+          print("ONCOTREE_NCIT_MAP",len(code_ncit),"OF",len(codes),
+                "AMBIGUOUS",len(ambiguous),json.dumps(list(code_ncit.items())[:20]))
 
           diseases=read_ot("disease",["id","name","dbXRefs"])
           ncit_to_ot={}
