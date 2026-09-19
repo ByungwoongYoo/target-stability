@@ -97,10 +97,12 @@ jobs:
               d=pd.read_csv(io.BytesIO(data),sep="\t")
               print("MEAN_FILE",drug,u,list(d.columns),len(d))
               # Mean rank files can use CD-coefficient or a rank/score column.
-              sym="symbol" if "symbol" in d.columns else None
+              sym="symbol" if "symbol" in d.columns else d.columns[0] if len(d.columns)>=2 else None
               score=None
               for col in ["CD-coefficient","score","mean","rank"]:
                   if col in d.columns: score=col; break
+              if score is None and len(d.columns)>=2:
+                  score=d.columns[1]
               if sym is None or score is None:
                   print("BAD_MEAN_COLS",drug,list(d.columns)); lcache[drug]=None; return None
               d["gene"]=d[sym].astype(str).str.upper().str.strip()
