@@ -1,0 +1,59 @@
+name: O04 CDSDB official unfiltered signature probe
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas
+      - name: Run official threshold regeneration path
+        run: |
+          python - <<'PY'
+          import requests,time,json,pandas as pd
+          CDS="http://cdsdb.ncpsb.org.cn"
+          S=requests.Session()
+          S.headers.update({"User-Agent":"o04-official-probe/0.1","Accept":"application/json","Content-Type":"application/json"})
+          ids=["CDS_dataset_Microarray_149","CDS_dataset_Microarray_150"]
+          p=1
+          logfc=0
+          def post(path,payload):
+              r=S.post(CDS+path,json=payload,timeout=180,headers={"Referer":CDS+"/analysisResult"})
+              print("POST",path,r.status_code,len(r.content),r.text[:500])
+              r.raise_for_status()
+              try:return r.json()
+              except:return {}
+          for did in ids:
+              job=f"{did}-{p}-{logfc}"
+              payload={"level":"level1","jobId":job,"pValue":p,"logFC":logfc,"raw":"dataset","CDSID":did}
+              print("CREATE",did,payload)
+              post("/cdsdb/updateLogFCScript",payload)
+              status=None
+              for k in range(120):
+                  st=post("/cdsdb/getTaskStatus",{"jobId":job,"level":"level1","logFC":logfc,"pValue":p})
+                  print("STATUS",did,k,st)
+                  if st.get("code")==0:
+                      status=st; break
+                  if st.get("code") not in (3,None):
+                      raise RuntimeError(f"bad status {st}")
+                  time.sleep(2)
+              if status is None: raise TimeoutError(did)
+              obj=post("/cdsdb/analysisResults",{"jobId":job,"level":"level1","logFC":logfc,"pValue":p})
+              deg=((obj.get("results") or {}).get("deg") or {})
+              tab=deg.get("tableData") or []
+              sig=deg.get("signatureData") or []
+              print("RESULT",did,"TABLE",len(tab),"SIGNATURE",len(sig),"KEYS",list(deg.keys()))
+              if tab:
+                  d=pd.DataFrame(tab)
+                  print("COLS",list(d.columns))
+                  print("LOGFC_NA",pd.to_numeric(d.get("LogFC"),errors="coerce").isna().sum() if "LogFC" in d else None)
+                  print("HEAD",json.dumps(tab[:3],ensure_ascii=False)[:4000])
+          PY
