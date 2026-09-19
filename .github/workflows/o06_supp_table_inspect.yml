@@ -1,0 +1,35 @@
+name: O06 supplementary table inspect
+
+on:
+  push:
+    branches:
+      - o06-natural-knockout-cancer-dependency-20260919
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl
+      - name: Inspect supplementary workbook
+        run: |
+          python - <<'PY'
+          import io,json,requests,pandas as pd
+          url="https://www.medrxiv.org/content/medrxiv/early/2026/05/15/2026.05.13.26352722/DC1/embed/media-1.xlsx?download=true"
+          H={"User-Agent":"Mozilla/5.0","Referer":"https://www.medrxiv.org/content/10.64898/2026.05.13.26352722v1.supplementary-material"}
+          r=requests.get(url,headers=H,timeout=300)
+          print("DL",r.status_code,len(r.content),r.headers.get("content-type"),r.url)
+          r.raise_for_status()
+          xf=pd.ExcelFile(io.BytesIO(r.content))
+          print("SHEETS",json.dumps(xf.sheet_names))
+          for sh in xf.sheet_names:
+              df=pd.read_excel(io.BytesIO(r.content),sheet_name=sh,nrows=12)
+              print("=== SHEET",sh,"===")
+              print("HEAD_SHAPE",df.shape)
+              print("COLS",json.dumps([str(c) for c in df.columns],ensure_ascii=False))
+              print("HEAD",df.head(8).to_json(orient="records",force_ascii=False)[:20000])
+          PY
