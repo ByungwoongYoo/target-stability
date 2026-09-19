@@ -1,0 +1,98 @@
+name: O02 medRxiv supplement probe
+
+on:
+  push:
+    branches:
+      - o02-cross-ancestry-proteogenomics-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install playwright pandas openpyxl
+          python -m playwright install --with-deps chromium
+      - name: Download both medRxiv supplements
+        shell: bash
+        run: |
+          mkdir -p o02_medrxiv
+          cat >/tmp/mrx.py <<'PY'
+          import asyncio,json,re,zipfile,hashlib
+          from pathlib import Path
+          import pandas as pd
+          from playwright.async_api import async_playwright
+
+          OUT=Path("o02_medrxiv");OUT.mkdir(exist_ok=True)
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"
+          papers={
+            "EAS":"https://www.medrxiv.org/content/10.64898/2026.02.05.26345625v1.supplementary-material",
+            "EUR":"https://www.medrxiv.org/content/10.64898/2026.07.23.26358667v1.supplementary-material",
+          }
+          async def main():
+            async with async_playwright() as p:
+              b=await p.chromium.launch(headless=True)
+              ctx=await b.new_context(accept_downloads=True,user_agent=UA)
+              got=[]
+              for lab,u in papers.items():
+                pg=await ctx.new_page()
+                await pg.goto(u,wait_until="domcontentloaded",timeout=120000)
+                await pg.wait_for_timeout(2500)
+                print("PAGE",lab,await pg.title(),pg.url)
+                links=await pg.locator("a").evaluate_all("""els=>els.map(e=>({text:(e.innerText||'').trim(),href:e.href||'',download:e.download||''}))""")
+                print("LINKS",lab,json.dumps(links,indent=2)[:30000])
+                for i,x in enumerate(links):
+                  href=x.get("href","")
+                  txt=x.get("text","")
+                  if not href: continue
+                  if not re.search(r'supp|\.xlsx|\.xls|\.zip|\.csv|download|DC\d|article-data',href+" "+txt,re.I): continue
+                  try:
+                    rr=await ctx.request.get(href,timeout=120000)
+                    body=await rr.body();ct=rr.headers.get("content-type","")
+                    print("GET",lab,i,rr.status,ct,len(body),txt,href)
+                    if rr.status==200 and len(body)>10000 and body[:2]==b"PK":
+                      ext=".zip" if ("zip" in ct.lower() or href.lower().split("?")[0].endswith(".zip")) else ".xlsx"
+                      q=OUT/f"{lab}_{len([z for z in got if z[0]==lab])}{ext}"
+                      q.write_bytes(body);got.append((lab,str(q)))
+                  except Exception as e:print("ERR",lab,href,repr(e))
+                await pg.close()
+              await b.close()
+              return got
+          got=asyncio.run(main())
+          print("GOT",json.dumps(got))
+
+          def inspect(path,lab):
+            try: xf=pd.ExcelFile(path)
+            except Exception as e:print("XERR",lab,path,repr(e));return
+            print("SHEETS",lab,json.dumps(xf.sheet_names))
+            for sh in xf.sheet_names:
+              try:
+                d=pd.read_excel(path,sheet_name=sh,nrows=5)
+                print("SHEET",lab,sh,"COLS",json.dumps([str(c) for c in d.columns[:100]]))
+                print("HEAD",lab,sh,d.head(2).to_json(orient="records",default_handler=str)[:4000])
+              except Exception as e:print("SHERR",lab,sh,repr(e))
+          for lab,p in got:
+            q=Path(p)
+            if q.suffix==".xlsx":inspect(q,lab)
+            else:
+              try:
+                z=zipfile.ZipFile(q);print("ZIP",lab,json.dumps(z.namelist()[:100]))
+                for n in z.namelist():
+                  if n.lower().endswith((".xlsx",".xls")):
+                    x=OUT/(lab+"_"+Path(n).name);x.write_bytes(z.read(n));inspect(x,lab)
+              except Exception as e:print("ZERR",lab,repr(e))
+          print("FILES")
+          for q in OUT.iterdir():
+            if q.is_file():print(q.name,q.stat().st_size,hashlib.sha256(q.read_bytes()).hexdigest())
+          PY
+          python /tmp/mrx.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o02-medrxiv-supplements
+          path: o02_medrxiv/
+          retention-days: 3
