@@ -66,7 +66,7 @@ jobs:
           def cds_top500(did):
               obj=req("POST",CDS+"/cdsdb/analysisResults",
                       headers={"Content-Type":"application/json","Accept":"application/json"},
-                      json={"jobId":did,"level":"raw/dataset","logFC":0.0,"pValue":1.0}).json()
+                      json={"jobId":did,"level":"raw/dataset","logFC":1e-9,"pValue":1.0}).json()
               tab=((obj.get("results") or {}).get("deg") or {}).get("tableData") or []
               df=pd.DataFrame(tab)
               if df.empty or "Gene symbol" not in df or "LogFC" not in df: return None
