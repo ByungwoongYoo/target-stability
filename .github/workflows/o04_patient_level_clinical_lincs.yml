@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install
-        run: pip install requests pandas numpy scipy
+        run: pip install requests pandas numpy scipy statsmodels
       - name: Run patient-level pilot
         shell: bash
         run: |
