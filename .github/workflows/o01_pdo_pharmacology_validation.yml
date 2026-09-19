@@ -220,7 +220,23 @@ jobs:
 
           # Flatten mechanism rows robustly.
           flat=[]
-          if "chemblId" in moa.columns and "rows" in moa.columns:
+          if "chemblIds" in moa.columns and "targets" in moa.columns:
+              # Open Targets 26.06 flat schema: one mechanism row can carry multiple ChEMBL IDs and targets.
+              for _,r in moa.iterrows():
+                  cids=r.get("chemblIds")
+                  tids=r.get("targets")
+                  if not isinstance(cids,(list,tuple,np.ndarray)):
+                      cids=[cids] if cids is not None and not (isinstance(cids,float) and np.isnan(cids)) else []
+                  if not isinstance(tids,(list,tuple,np.ndarray)):
+                      tids=[tids] if tids is not None and not (isinstance(tids,float) and np.isnan(tids)) else []
+                  act=r.get("actionType")
+                  mech=r.get("mechanismOfAction")
+                  for cid in cids:
+                      for tid in tids:
+                          if cid is not None and tid is not None:
+                              flat.append({"chemblId":str(cid),"targetId":str(tid),
+                                           "actionType":act,"mechanism":mech})
+          elif "chemblId" in moa.columns and "rows" in moa.columns:
               for _,r in moa.iterrows():
                   cid=str(r["chemblId"])
                   rows=r["rows"]
@@ -233,13 +249,16 @@ jobs:
                       for tid in tids:
                           flat.append({"chemblId":cid,"targetId":str(tid),"actionType":act,"mechanism":mech})
           else:
-              # fallback for a flat table
-              cid_col=next((c for c in ["chemblId","drugId","id"] if c in moa.columns),None)
-              targ_col=next((c for c in ["targets","targetId"] if c in moa.columns),None)
-              act_col=next((c for c in ["actionType","action_type"] if c in moa.columns),None)
+              # fallback for other flat table shapes
+              cid_col=next((x for x in ["chemblId","drugId","id"] if x in moa.columns),None)
+              targ_col=next((x for x in ["targets","targetId"] if x in moa.columns),None)
+              act_col=next((x for x in ["actionType","action_type"] if x in moa.columns),None)
+              if cid_col is None or targ_col is None:
+                  raise RuntimeError(f"Unsupported MoA schema: {list(moa.columns)}")
               for _,r in moa.iterrows():
-                  tids=r.get(targ_col) if targ_col else []
-                  if not isinstance(tids,(list,tuple,np.ndarray)): tids=[tids] if pd.notna(tids) else []
+                  tids=r.get(targ_col)
+                  if not isinstance(tids,(list,tuple,np.ndarray)):
+                      tids=[tids] if tids is not None and not (isinstance(tids,float) and np.isnan(tids)) else []
                   for tid in tids:
                       flat.append({"chemblId":str(r[cid_col]),"targetId":str(tid),
                                    "actionType":r.get(act_col) if act_col else None,"mechanism":None})
