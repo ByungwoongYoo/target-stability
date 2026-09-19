@@ -1,0 +1,38 @@
+name: O07 IGNITE data inspect
+
+on:
+  push:
+    branches:
+      - o07-perturbseq-trial-failure-20260919
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests
+      - name: Inspect static score assets
+        shell: bash
+        run: |
+          python - <<'PY'
+          import requests,re,json,ast
+          H={"User-Agent":"Mozilla/5.0"}
+          for name in ["target-data.js","cfg-data.js","polarization-data.js","support.js","Portal.dc.html"]:
+              u="https://ignite.eecs.umich.edu/"+name
+              r=requests.get(u,headers=H,timeout=180)
+              print("\n=== FILE",name,"STATUS",r.status_code,"BYTES",len(r.content),"CTYPE",r.headers.get("content-type"),"===")
+              r.raise_for_status()
+              t=r.text
+              print("HEAD",t[:12000])
+              # discover declarations and likely field names
+              decl=re.findall(r'(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=',t)
+              print("DECLARATIONS",decl[:100])
+              keys=sorted(set(re.findall(r'["\']([A-Za-z_][A-Za-z0-9_ .+/%()-]{1,60})["\']\s*:',t)))
+              print("OBJECT_KEYS",json.dumps(keys[:400]))
+              urls=sorted(set(re.findall(r'https?://[^"\'\s<>]+',t)))
+              print("URLS",json.dumps(urls[:100]))
+          PY
