@@ -1,0 +1,97 @@
+name: O07 fast table recovery
+
+on:
+  push:
+    branches:
+      - o07-autoimmune-cross-lineage-20260919
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl
+      - name: Fetch B zip and T OA package
+        shell: bash
+        run: |
+          mkdir -p o07_fast
+          python - <<'PY'
+          import requests,io,zipfile,tarfile,re,json,hashlib
+          from pathlib import Path
+          import pandas as pd
+          OUT=Path("o07_fast")
+          H={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"}
+
+          def inspect(data,name):
+              p=OUT/name; p.write_bytes(data)
+              print("SAVED",name,len(data),hashlib.sha256(data).hexdigest(),data[:8])
+              try:
+                  xf=pd.ExcelFile(io.BytesIO(data))
+                  print("XLS",name,xf.sheet_names)
+                  for sh in xf.sheet_names:
+                      try:
+                          raw=pd.read_excel(io.BytesIO(data),sheet_name=sh,header=None,nrows=12)
+                          print("RAW",name,sh,raw.to_json(orient="split",default_handler=str)[:12000])
+                          df=pd.read_excel(io.BytesIO(data),sheet_name=sh,nrows=8)
+                          print("HDR",name,sh,json.dumps([str(c) for c in df.columns[:160]]))
+                      except Exception as e: print("SHEETERR",name,sh,repr(e))
+              except Exception as e: print("NOTXLS",name,repr(e))
+
+          # B-cell supplementary ZIP
+          bu="https://www.biorxiv.org/content/biorxiv/early/2026/03/02/2026.03.01.708923/DC1/embed/media-1.zip?download=true"
+          r=requests.get(bu,headers=H,timeout=180,allow_redirects=True)
+          print("BZIP",r.status_code,len(r.content),r.headers.get("content-type"),r.url,r.content[:8])
+          if r.status_code==200 and len(r.content)>1000:
+              (OUT/"B_media-1.zip").write_bytes(r.content)
+              try:
+                  z=zipfile.ZipFile(io.BytesIO(r.content))
+                  print("BZIP_NAMES",json.dumps(z.namelist(),ensure_ascii=False)[:30000])
+                  for n in z.namelist():
+                      if re.search(r'\.(xlsx|xls|csv|tsv)$',n,re.I):
+                          inspect(z.read(n),"B_"+re.sub(r'[^A-Za-z0-9_.-]+','_',n)[-180:])
+              except Exception as e: print("BZIPERR",repr(e))
+
+          # T-cell OA package API
+          for u in [
+              "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id=PMC13060838",
+              "https://pmc.ncbi.nlm.nih.gov/utils/oa/oa.fcgi?id=PMC13060838"
+          ]:
+              rr=requests.get(u,headers=H,timeout=120,allow_redirects=True)
+              print("OA",u,rr.status_code,len(rr.content),rr.headers.get("content-type"),rr.url)
+              print("OA_TEXT",rr.text[:10000])
+              if rr.status_code==200:
+                  urls=re.findall(r'href="([^"]+)"',rr.text)
+                  print("OA_URLS",json.dumps(urls))
+                  for j,au in enumerate(urls):
+                      try:
+                          ar=requests.get(au,headers=H,timeout=240,allow_redirects=True)
+                          print("OA_ARCH",j,ar.status_code,len(ar.content),ar.headers.get("content-type"),ar.url,ar.content[:8])
+                          if ar.status_code==200 and len(ar.content)>1000:
+                              (OUT/f"T_archive_{j}.bin").write_bytes(ar.content)
+                              try:
+                                  tf=tarfile.open(fileobj=io.BytesIO(ar.content),mode="r:*")
+                                  names=tf.getnames(); print("TAR_NAMES",json.dumps(names[:500]))
+                                  for m in tf.getmembers():
+                                      if m.isfile() and re.search(r'\.(xlsx|xls|csv|tsv)$',m.name,re.I):
+                                          d=tf.extractfile(m).read()
+                                          inspect(d,"T_"+re.sub(r'[^A-Za-z0-9_.-]+','_',m.name)[-180:])
+                              except Exception as e: print("TARERR",repr(e))
+                      except Exception as e: print("OA_ARCH_ERR",repr(e))
+                  break
+
+          # Print direct challenge body once
+          u="https://pmc.ncbi.nlm.nih.gov/articles/instance/13060838/bin/media-3.xlsx"
+          rr=requests.get(u,headers={**H,"Referer":"https://pmc.ncbi.nlm.nih.gov/articles/PMC13060838/"},timeout=120,allow_redirects=True)
+          print("T_DIRECT_SAMPLE",rr.status_code,len(rr.content),rr.headers.get("content-type"),rr.url)
+          print("T_DIRECT_BODY",rr.text[:5000])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o07-fast-tables
+          path: o07_fast/
+          retention-days: 5
