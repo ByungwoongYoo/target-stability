@@ -8,20 +8,18 @@ on:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 10
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - name: Install
         run: pip install requests
-      - name: Probe MassIVE processed files
-        shell: bash
+      - name: Resolve processed files through public MassIVE proxy index
         run: |
-          set -euxo pipefail
           python - <<'PY'
-          import requests,re,json
-          accessions={
+          import requests,json
+          datasets={
             "human":"MSV000099729",
             "cyno":"MSV000099734",
             "dog":"MSV000099744",
@@ -29,27 +27,30 @@ jobs:
             "rat":"MSV000099753",
             "mouse":"MSV000099754",
           }
-          H={"User-Agent":"o05-cross-species/0.1"}
-          for sp,acc in accessions.items():
-              urls=[
-                f"https://massive.ucsd.edu/ProteoSAFe/dataset_files.jsp?task={acc}",
-                f"https://massive.ucsd.edu/ProteoSAFe/DownloadResultFile?file=f.{acc}",
-                f"https://proteomecentral.proteomexchange.org/cgi/GetDataset?ID={acc}",
-                f"https://massive.ucsd.edu/ProteoSAFe/static/massive.jsp?task={acc}",
-              ]
-              print("SPECIES",sp,acc)
-              for u in urls:
-                  try:
-                      r=requests.get(u,headers=H,timeout=90,allow_redirects=True)
-                      print("URL",u,"STATUS",r.status_code,"BYTES",len(r.content),"FINAL",r.url,"CTYPE",r.headers.get("content-type"))
-                      txt=r.text if "text" in (r.headers.get("content-type") or "") or len(r.content)<5000000 else ""
-                      hits=sorted(set(re.findall(r'[^"\'<>\s]{0,160}(?:t04_protein_postbridge_ibaq_pd\.txt|\.txt|\.tsv|\.csv)[^"\'<>\s]{0,80}',txt,re.I)))
-                      if hits: print("HITS",json.dumps(hits[:200]))
-                  except Exception as e: print("ERR",repr(e))
+          H={"User-Agent":"o05-cross-species/0.2"}
+          base="https://massiveproxy.gnps2.org/ftpfilelog/datasets"
+          for sp,acc in datasets.items():
+              u=f"{base}/{acc}/files"
+              r=requests.get(u,headers=H,timeout=90)
+              print("LIST",sp,acc,r.status_code,len(r.content),r.headers.get("content-type"))
+              if r.status_code!=200:
+                  print(r.text[:1000]); continue
+              try: obj=r.json()
+              except Exception:
+                  obj=r.text.splitlines()
+              print("TYPE",type(obj).__name__)
+              # normalize all path-like strings recursively
+              vals=[]
+              def walk(x):
+                  if isinstance(x,str): vals.append(x)
+                  elif isinstance(x,list):
+                      for y in x: walk(y)
+                  elif isinstance(x,dict):
+                      for y in x.values(): walk(y)
+              walk(obj)
+              hits=sorted({x for x in vals if "t04_protein_postbridge_ibaq_pd.txt" in x})
+              print("HITS",sp,json.dumps(hits))
+              # broader processed files
+              broad=sorted({x for x in vals if any(k in x.lower() for k in ["postbridge","ibaq","protein"]) and x.lower().endswith((".txt",".tsv",".csv"))})
+              print("BROAD",sp,json.dumps(broad[:100]))
           PY
-          for acc in MSV000099729 MSV000099734 MSV000099744 MSV000099746 MSV000099753 MSV000099754; do
-            echo "FTP $acc"
-            curl -L --max-time 60 --list-only "ftp://massive-ftp.ucsd.edu/v11/$acc/" 2>&1 | head -200 || true
-            echo "HTTPS_DIR $acc"
-            curl -L --max-time 60 "https://massive.ucsd.edu/ProteoSAFe/DownloadResultFile?file=f.$acc" 2>&1 | head -100 || true
-          done
