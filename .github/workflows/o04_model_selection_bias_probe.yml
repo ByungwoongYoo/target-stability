@@ -1,0 +1,121 @@
+name: O04 patient-derived model selection-bias probe
+
+on:
+  push:
+    branches:
+      - o04-model-selection-bias-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl
+      - name: Probe HCMI and Sanger donor-level metadata
+        shell: bash
+        run: |
+          mkdir -p o04_probe
+          cat > /tmp/o04_probe.py <<'PY'
+          import io, json, os, re, zipfile, hashlib, time
+          from pathlib import Path
+          import requests, pandas as pd
+          OUT=Path("o04_probe")
+          UA={"User-Agent":"Mozilla/5.0"}
+
+          def get(url, tries=5):
+              last=None
+              for i in range(tries):
+                  try:
+                      r=requests.get(url,headers=UA,timeout=240,allow_redirects=True)
+                      print("GET",url,"TRY",i+1,"STATUS",r.status_code,"CTYPE",r.headers.get("content-type"),"BYTES",len(r.content),"FINAL",r.url)
+                      if r.status_code<500:
+                          r.raise_for_status()
+                          return r.content
+                      last=RuntimeError(f"HTTP {r.status_code}")
+                  except Exception as e:
+                      last=e
+                  time.sleep(2*(i+1))
+              raise last
+
+          def inspect_excel_bytes(data,label):
+              try:
+                  xf=pd.ExcelFile(io.BytesIO(data))
+              except Exception as e:
+                  print("EXCEL_FAIL",label,repr(e)); return {}
+              print("XLS_SHEETS",label,json.dumps(xf.sheet_names))
+              meta={}
+              for sh in xf.sheet_names:
+                  try:
+                      raw=pd.read_excel(io.BytesIO(data),sheet_name=sh,header=None,nrows=20)
+                      print("RAW",label,sh,raw.to_json(orient="split",default_handler=str)[:12000])
+                      # find first plausible header row among first 15 rows
+                      best=None
+                      for hr in range(min(15,len(raw))):
+                          vals=[str(x) for x in raw.iloc[hr].tolist()]
+                          score=sum(bool(re.search(r'(sample|donor|patient|model|success|status|failure|cancer|tumou?r|histology|stage|age|sex|gender|race|ethnic|treatment|preserv|bank|passage)',v,re.I)) for v in vals)
+                          if best is None or score>best[0]: best=(score,hr)
+                      hr=best[1] if best else 0
+                      df=pd.read_excel(io.BytesIO(data),sheet_name=sh,header=hr)
+                      cols=[str(c) for c in df.columns]
+                      print("SHEET_META",label,sh,"HEADER_ROW",hr,"ROWS",len(df),"COLS",len(cols))
+                      print("COLS",label,sh,json.dumps(cols[:200]))
+                      # useful value counts for likely outcome/status fields
+                      for c in cols:
+                          if re.search(r'(success|status|failure|fail|derived|establish|bank|model.*type|cancer|tumou?r.*type|histology|stage|sex|gender|race|ethnic|preserv)',c,re.I):
+                              try:
+                                  vc=df[c].astype(str).value_counts(dropna=False).head(30).to_dict()
+                                  print("VC",label,sh,c,json.dumps(vc,default=str)[:10000])
+                              except Exception as e:
+                                  print("VC_ERR",label,sh,c,repr(e))
+                      meta[sh]={"rows":len(df),"header_row":hr,"columns":cols}
+                  except Exception as e:
+                      print("SHEET_FAIL",label,sh,repr(e))
+              return meta
+
+          # HCMI Supplementary Table 1 from GDC publication page.
+          hcmi_url="https://api.gdc.cancer.gov/data/30fabbdd-9a3f-4222-b4c8-9e1a4b556c31"
+          hcmi=get(hcmi_url)
+          (OUT/"HCMI_SuppTable1.xlsx").write_bytes(hcmi)
+          print("HCMI_SHA256",hashlib.sha256(hcmi).hexdigest())
+          hm=inspect_excel_bytes(hcmi,"HCMI")
+
+          # Sanger Supplementary Tables archive used by the Nature paper.
+          sanger_url="https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/MediaObjects/41586_2026_10830_MOESM3_ESM.zip"
+          sz=get(sanger_url)
+          (OUT/"Sanger_supp_tables.zip").write_bytes(sz)
+          print("SANGER_ZIP_SHA256",hashlib.sha256(sz).hexdigest())
+          z=zipfile.ZipFile(io.BytesIO(sz))
+          print("SANGER_ZIP_NAMES",json.dumps(z.namelist()))
+          smeta={}
+          for name in z.namelist():
+              if re.search(r'supplementary[_ -]?table[_ -]?1|table_1|table1',name,re.I):
+                  data=z.read(name)
+                  print("SANGER_TABLE1_FILE",name,"BYTES",len(data))
+                  (OUT/Path(name).name).write_bytes(data)
+                  if name.lower().endswith((".xlsx",".xls")):
+                      smeta[name]=inspect_excel_bytes(data,"SANGER_TABLE1")
+                  elif name.lower().endswith((".csv",".tsv")):
+                      sep="\t" if name.lower().endswith(".tsv") else ","
+                      df=pd.read_csv(io.BytesIO(data),sep=sep)
+                      print("SANGER_CSV_ROWS",len(df),"COLS",json.dumps(list(map(str,df.columns))))
+                      for c in df.columns:
+                          if re.search(r'(success|status|failure|fail|derived|establish|bank|cancer|tumou?r|histology|stage|sex|gender|race|ethnic|preserv)',str(c),re.I):
+                              print("VC SANGER_CSV",c,json.dumps(df[c].astype(str).value_counts().head(30).to_dict(),default=str))
+              # also inspect any file obviously related to derivation
+              elif re.search(r'deriv|biobank|attempt|failure',name,re.I):
+                  print("SANGER_RELATED_FILE",name)
+
+          summary={"HCMI":hm,"SANGER":smeta}
+          (OUT/"probe_summary.json").write_text(json.dumps(summary,indent=2),encoding="utf-8")
+          PY
+          python /tmp/o04_probe.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o04-selection-bias-probe
+          path: o04_probe/
+          retention-days: 3
