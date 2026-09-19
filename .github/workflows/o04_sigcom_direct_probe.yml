@@ -1,0 +1,42 @@
+name: O04 SigCom direct probe
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas
+      - name: Probe exact drug signatures
+        run: |
+          python - <<'PY'
+          import requests,json,io,pandas as pd
+          base="https://maayanlab.cloud/sigcom-lincs/metadata-api/signatures/find"
+          H={"User-Agent":"o04-probe/0.1"}
+          for drug in ["carboplatin","letrozole","prednisone","vemurafenib","everolimus"]:
+              payload={"filter":{"where":{"meta.pert_name":drug},"limit":20}}
+              r=requests.post(base,json=payload,headers=H,timeout=90)
+              print("QUERY",drug,r.status_code,len(r.content))
+              arr=r.json() if r.status_code==200 else []
+              print("N",len(arr))
+              for x in arr[:3]:
+                  m=x.get("meta",{})
+                  print("META",json.dumps({"id":x.get("id"),"library":x.get("library"),"pert_name":m.get("pert_name"),
+                     "pert_type":m.get("pert_type"),"cell_line":m.get("cell_line"),"pert_time":m.get("pert_time"),
+                     "pert_dose":m.get("pert_dose"),"persistent_id":m.get("persistent_id"),
+                     "filename":m.get("filename"),"data_level":m.get("data_level")},ensure_ascii=False))
+              urls=[x.get("meta",{}).get("persistent_id") for x in arr if x.get("meta",{}).get("persistent_id")]
+              if urls:
+                  u=urls[0]
+                  rr=requests.get(u,headers=H,timeout=120)
+                  print("FILE",drug,rr.status_code,len(rr.content),rr.headers.get("content-type"),u)
+                  print("PREFIX",rr.text[:2000])
+          PY
