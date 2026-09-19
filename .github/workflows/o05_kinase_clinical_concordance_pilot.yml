@@ -1,0 +1,222 @@
+name: O05 kinase clinical concordance pilot
+
+on:
+  push:
+    branches: [o05-kinase-clinical-concordance-20260919]
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Install
+        run: pip install pandas openpyxl requests scipy scikit-learn
+      - name: Run pair-level clinical concordance pilot
+        shell: bash
+        run: |
+          cat > /tmp/o05.py <<'PY'
+          import io,json,re,time,requests,numpy as np,pandas as pd
+          from scipy.stats import mannwhitneyu,fisher_exact
+          from sklearn.metrics import roc_auc_score
+          H={"User-Agent":"o05-kinase-clinical-concordance/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          SUPP="https://static-content.springer.com/esm/art%3A10.1038%2Fs41587-026-03090-8/MediaObjects/41587_2026_3090_MOESM4_ESM.xlsx"
+
+          def req(method,url,**kw):
+              last=None
+              for i in range(6):
+                  try:
+                      r=requests.request(method,url,headers=H,timeout=240,**kw)
+                      if r.status_code<500:
+                          r.raise_for_status(); return r
+                      last=RuntimeError(f"HTTP {r.status_code}")
+                  except Exception as e:last=e
+                  time.sleep(2*(i+1))
+              raise last
+
+          b=req("GET",SUPP).content
+
+          def read_with_first_header(sheet,key):
+              raw=pd.read_excel(io.BytesIO(b),sheet_name=sheet,header=None)
+              hit=None
+              for i,row in raw.iterrows():
+                  if str(row.iloc[0]).strip()==key:
+                      hit=i; break
+              if hit is None: raise RuntimeError(f"header {key} not found {sheet}")
+              return pd.read_excel(io.BytesIO(b),sheet_name=sheet,header=hit)
+
+          mut=read_with_first_header("Table S13","Compound")
+          wt=read_with_first_header("Table S4","Compound")
+          print("MATRIX",mut.shape,wt.shape)
+
+          alias={
+            "C_MET":"MET","C_KIT":"KIT","C_SRC":"SRC","C_MER":"MERTK",
+            "TRKA":"NTRK1","TRKB":"NTRK2","TRKC":"NTRK3",
+            "ALK2":"ACVR1","AURORA_B":"AURKB","MEK1":"MAP2K1","MEK2":"MAP2K2",
+            "P38A":"MAPK14","RSK2":"RPS6KA3","PKA":"PRKACA","CHK2":"CHEK2",
+            "CK1A1":"CSNK1A1","CK1EPSILON":"CSNK1E","PKD2":"PRKD2",
+            "C_RAF":"RAF1","C-RAF":"RAF1"
+          }
+          def cg(g):
+              g=str(g).strip().upper().replace("-","_")
+              return alias.get(g,g)
+          def normdrug(x): return re.sub(r"[^a-z0-9]","",str(x).lower())
+
+          # Matrix simple single-AA substitutions only.
+          mut_meta={}
+          for col in mut.columns[1:]:
+              s=str(col).strip()
+              m=re.fullmatch(r"([^()]+)\(([A-Z]\d+[A-Z*])\)",s,re.I)
+              if not m: continue
+              g=cg(m.group(1)); aa=m.group(2).upper()
+              mut_meta[(g,aa)]=s
+          print("SIMPLE_VARIANTS",len(mut_meta))
+
+          # WT columns by canonical gene name.
+          wt_col={}
+          for col in wt.columns[1:]:
+              raw=str(col).strip()
+              # ignore complexes where possible, but retain direct aliases.
+              g=cg(raw)
+              wt_col.setdefault(g,raw)
+          print("WT_COLS",len(wt_col))
+
+          # Drug row exact normalized-name map.
+          drug_rows={}
+          for i,x in enumerate(mut["Compound"].astype(str)):
+              drug_rows.setdefault(normdrug(x),[]).append(i)
+          print("DRUG_ROWS",len(drug_rows))
+
+          # Fetch all accepted Predictive CIViC evidence by GraphQL.
+          gql="https://civicdb.org/api/graphql"
+          q='''query E($after:String){
+            evidenceItems(evidenceType:PREDICTIVE,status:ACCEPTED,first:500,after:$after){
+              totalCount
+              pageInfo{hasNextPage endCursor}
+              nodes{
+                id evidenceLevel evidenceDirection significance status
+                molecularProfile{name rawName isMultiVariant}
+                therapies{name}
+                disease{name}
+              }
+            }
+          }'''
+          nodes=[]; after=None
+          while True:
+              rr=req("POST",gql,json={"query":q,"variables":{"after":after}}).json()
+              if rr.get("errors"): raise RuntimeError(rr["errors"])
+              z=rr["data"]["evidenceItems"]; nodes += z["nodes"]
+              if not z["pageInfo"]["hasNextPage"]: break
+              after=z["pageInfo"]["endCursor"]
+          print("CIVIC_ACCEPTED_PREDICTIVE",len(nodes))
+
+          # Match clinical A/B/C supported single-drug, single simple-variant evidence.
+          level_rank={"A":3,"B":2,"C":1}
+          rawmatches=[]
+          for e in nodes:
+              lev=e["evidenceLevel"]
+              if lev not in level_rank: continue
+              if e["evidenceDirection"]!="SUPPORTS": continue
+              sig=e["significance"]
+              if sig not in ["SENSITIVITYRESPONSE","RESISTANCE","REDUCED_SENSITIVITY"]: continue
+              mp=e["molecularProfile"]
+              if mp.get("isMultiVariant"): continue
+              ts=e.get("therapies") or []
+              if len(ts)!=1: continue
+              dn=normdrug(ts[0]["name"])
+              if dn not in drug_rows: continue
+              name=str(mp.get("name","")).upper()
+              # Match against actual matrix simple variants, not a free-form parser.
+              cand=[]
+              for (g,aa),col in mut_meta.items():
+                  if re.search(rf'(?<![A-Z0-9]){re.escape(g)}(?![A-Z0-9])',name) and re.search(rf'(?<![A-Z0-9]){re.escape(aa)}(?![A-Z0-9])',name):
+                      cand.append((g,aa,col))
+              if len(cand)!=1: continue
+              g,aa,col=cand[0]
+              # Matrix has one row per compound.
+              idx=drug_rows[dn]
+              vals=pd.to_numeric(mut.loc[idx,col],errors="coerce").dropna()
+              if vals.empty: continue
+              residual=float(vals.mean())
+              wtres=None
+              if g in wt_col:
+                  wv=pd.to_numeric(wt.loc[idx,wt_col[g]],errors="coerce").dropna()
+                  if not wv.empty: wtres=float(wv.mean())
+              rawmatches.append({
+                "eid":e["id"],"level":lev,"sig":sig,"gene":g,"aa":aa,
+                "variant_col":col,"drug":str(mut.loc[idx[0],"Compound"]),
+                "drug_norm":dn,"residual":residual,"wt_residual":wtres,
+                "delta_vs_wt": residual-wtres if wtres is not None else None,
+                "disease":e["disease"]["name"],"mp":mp["name"]
+              })
+          rm=pd.DataFrame(rawmatches)
+          print("RAW_MATCH_EVIDENCE",len(rm),"GENES",rm.gene.nunique() if len(rm) else 0,"DRUGS",rm.drug.nunique() if len(rm) else 0)
+
+          # Pair-level label using the highest available CIViC evidence level.
+          pairrows=[]
+          if len(rm):
+              for (g,aa,dn),x in rm.groupby(["gene","aa","drug_norm"]):
+                  mx=x.level.map(level_rank).max()
+                  y=x[x.level.map(level_rank).eq(mx)].copy()
+                  labels=set("S" if s=="SENSITIVITYRESPONSE" else "R" for s in y.sig)
+                  if len(labels)!=1: continue
+                  lab=next(iter(labels))
+                  r0=y.iloc[0]
+                  pairrows.append({
+                    "gene":g,"aa":aa,"drug":r0.drug,"label":lab,
+                    "level":y.iloc[0].level,
+                    "residual":float(y.residual.mean()),
+                    "wt_residual":float(y.wt_residual.mean()) if y.wt_residual.notna().any() else None,
+                    "delta_vs_wt":float(y.delta_vs_wt.mean()) if y.delta_vs_wt.notna().any() else None,
+                    "n_evidence":len(y),
+                    "diseases":";".join(sorted(set(y.disease.astype(str))))
+                  })
+          p=pd.DataFrame(pairrows)
+          print("PAIR_MATCH",len(p),"S",int((p.label=="S").sum()) if len(p) else 0,"R",int((p.label=="R").sum()) if len(p) else 0,
+                "GENES",p.gene.nunique() if len(p) else 0,"DRUGS",p.drug.nunique() if len(p) else 0,
+                "AB",int(p.level.isin(["A","B"]).sum()) if len(p) else 0)
+
+          def analyze(x,label):
+              out={"name":label,"n":len(x),"S":int((x.label=="S").sum()),"R":int((x.label=="R").sum()),
+                   "genes":int(x.gene.nunique()),"drugs":int(x.drug.nunique())}
+              if out["S"]<2 or out["R"]<2: return out
+              y=(x.label=="S").astype(int).values
+              # Lower residual predicts clinical sensitivity.
+              out["median_residual_S"]=float(x.loc[x.label=="S","residual"].median())
+              out["median_residual_R"]=float(x.loc[x.label=="R","residual"].median())
+              out["mw_residual_p"]=float(mannwhitneyu(x.loc[x.label=="S","residual"],x.loc[x.label=="R","residual"],alternative="two-sided").pvalue)
+              out["auc_inhibition"]=float(roc_auc_score(y,-x.residual.values))
+              inhibited=x.residual<30.0
+              a=int(((x.label=="S")&inhibited).sum()); b=int(((x.label=="S")&~inhibited).sum())
+              c=int(((x.label=="R")&inhibited).sum()); d=int(((x.label=="R")&~inhibited).sum())
+              OR,fp=fisher_exact([[a,b],[c,d]],alternative="two-sided")
+              out["threshold70"]={"S_inhibited":a,"S_not":b,"R_inhibited":c,"R_not":d,"OR":float(OR),"p":float(fp)}
+              z=x.dropna(subset=["delta_vs_wt"]).copy()
+              out["delta_n"]=len(z)
+              if (z.label=="S").sum()>=2 and (z.label=="R").sum()>=2:
+                  yy=(z.label=="S").astype(int).values
+                  out["median_delta_S"]=float(z.loc[z.label=="S","delta_vs_wt"].median())
+                  out["median_delta_R"]=float(z.loc[z.label=="R","delta_vs_wt"].median())
+                  out["mw_delta_p"]=float(mannwhitneyu(z.loc[z.label=="S","delta_vs_wt"],z.loc[z.label=="R","delta_vs_wt"],alternative="two-sided").pvalue)
+                  # More negative delta predicts sensitivity; positive predicts resistance.
+                  out["auc_delta"]=float(roc_auc_score(yy,-z.delta_vs_wt.values))
+              # Leave-one-gene/drug-out AUC for raw inhibition when estimable.
+              for key in ["gene","drug"]:
+                  vals=[]
+                  for k in x[key].unique():
+                      q=x[x[key]!=k]
+                      if q.label.nunique()==2 and len(q)>=8:
+                          vals.append(roc_auc_score((q.label=="S").astype(int),-q.residual))
+                  if vals:
+                      out[f"loo_{key}_auc_range"]=[float(min(vals)),float(max(vals))]
+              return out
+
+          res={"all_ABC":analyze(p,"ABC")}
+          if len(p):
+              res["AB_only"]=analyze(p[p.level.isin(["A","B"])].copy(),"AB")
+              res["pairs"]=p.sort_values(["level","gene","aa","drug"]).to_dict("records")
+          print("=== O05_CLINICAL_CONCORDANCE ===")
+          print(json.dumps(res,indent=2,default=str))
+          PY
+          python /tmp/o05.py
