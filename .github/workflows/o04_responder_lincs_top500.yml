@@ -1,0 +1,154 @@
+name: O04 responder LINCS top500 pilot
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy scipy
+      - name: Run fixed top500 concordance pilot
+        run: |
+          python - <<'PY'
+          import requests,pandas as pd,numpy as np,re,json,io,time
+          from scipy.stats import spearmanr,wilcoxon,binomtest
+          S=requests.Session()
+          S.headers.update({"User-Agent":"o04-top500/0.1"})
+          CDS="http://cdsdb.ncpsb.org.cn"
+          SIG="https://maayanlab.cloud/sigcom-lincs/metadata-api/signatures/find"
+
+          def norm(x): return re.sub(r'[^a-z0-9]','',str(x).lower())
+          def req(method,url,**kw):
+              last=None
+              for a in range(4):
+                  try:
+                      r=S.request(method,url,timeout=180,**kw)
+                      if r.status_code<500:
+                          r.raise_for_status(); return r
+                      last=RuntimeError(f"{r.status_code} {r.text[:200]}")
+                  except Exception as e: last=e
+                  time.sleep(2*(a+1))
+              raise last
+
+          # metadata + strict response/non-response pairs
+          meta=req("POST",CDS+"/cdsdb/browse/dataset",
+                   headers={"Content-Type":"application/json","Accept":"application/json"},
+                   json={"skip":0,"limit":500,"page":1,"filter":{},"sort":{}}).json()["data"]
+          byid={str(r.get("CDS-DB dataset ID")):r for r in meta}
+          pairs=[]; seen=set()
+          for r in meta:
+              rid=str(r.get("CDS-DB dataset ID","")); opp=str(r.get("CDS-DB dataset with the opposite response group","")).strip()
+              rg=str(r.get("Response group","")).strip().lower(); drugs=r.get("drugNames") or []
+              if rg not in {"response","non-response"} or not opp or opp not in byid or len(drugs)!=1: continue
+              o=byid[opp]; od=o.get("drugNames") or []; org=str(o.get("Response group","")).strip().lower()
+              if len(od)!=1 or norm(drugs[0])!=norm(od[0]) or {rg,org}!={"response","non-response"}: continue
+              key=tuple(sorted([rid,opp]))
+              if key in seen: continue
+              seen.add(key)
+              rr=r if rg=="response" else o; nn=o if rg=="response" else r
+              if norm(rr.get("Source dataset"))!=norm(nn.get("Source dataset")): continue
+              if norm(rr.get("Cancer subtype"))!=norm(nn.get("Cancer subtype")): continue
+              if norm(rr.get("Therapeutic regimen"))!=norm(nn.get("Therapeutic regimen")): continue
+              pairs.append({"drug":str(drugs[0]),"response_id":str(rr["CDS-DB dataset ID"]),
+                            "nonresponse_id":str(nn["CDS-DB dataset ID"]),"source":str(rr.get("Source dataset","")),
+                            "cancer":str(rr.get("Cancer subtype",""))})
+          print("STRICT_PAIRS",len(pairs))
+
+          # No outcome-based DEG threshold: request effectively unfiltered table, portal caps display at top500.
+          def cds_top500(did):
+              obj=req("POST",CDS+"/cdsdb/analysisResults",
+                      headers={"Content-Type":"application/json","Accept":"application/json"},
+                      json={"jobId":did,"level":"raw/dataset","logFC":0.0,"pValue":1.0}).json()
+              tab=((obj.get("results") or {}).get("deg") or {}).get("tableData") or []
+              df=pd.DataFrame(tab)
+              if df.empty or "Gene symbol" not in df or "LogFC" not in df: return None
+              df["coef"]=pd.to_numeric(df["LogFC"],errors="coerce")
+              df=df.dropna(subset=["coef","Gene symbol"]).copy()
+              df["gene"]=df["Gene symbol"].astype(str).str.strip()
+              # keep largest absolute coefficient if aliases duplicate
+              df["abs"]=df.coef.abs()
+              df=df.sort_values("abs",ascending=False).drop_duplicates("gene").head(500)
+              return dict(zip(df.gene,df.coef))
+
+          lcache={}
+          def lincs_profiles(drug):
+              if drug in lcache:return lcache[drug]
+              payload={"filter":{"where":{"meta.pert_name":drug.lower()},"limit":100}}
+              arr=req("POST",SIG,json=payload).json()
+              prof=[]
+              for x in arr:
+                  m=x.get("meta",{})
+                  if str(m.get("pert_type","")).lower()!="chemical": continue
+                  if not m.get("cell_line"): continue # exclude mean signatures
+                  u=m.get("persistent_id")
+                  if not u: continue
+                  try:
+                      rr=req("GET",u)
+                      d=pd.read_csv(io.StringIO(rr.text),sep="\t")
+                      if "symbol" not in d or "CD-coefficient" not in d: continue
+                      d["coef"]=pd.to_numeric(d["CD-coefficient"],errors="coerce")
+                      d=d.dropna(subset=["symbol","coef"]).drop_duplicates("symbol")
+                      prof.append({"id":x.get("id"),"cell":m.get("cell_line"),"time":m.get("pert_time"),
+                                   "dose":m.get("pert_dose"),"coef":dict(zip(d.symbol.astype(str),d.coef))})
+                  except Exception as e: print("LINCS_FILE_ERR",drug,u,repr(e))
+              lcache[drug]=prof
+              print("LINCS_PROFILES",drug,len(prof))
+              return prof
+
+          def score(patient,profs):
+              vals=[]
+              for p in profs:
+                  common=sorted(set(patient)&set(p["coef"]))
+                  if len(common)<100: continue
+                  a=np.array([patient[g] for g in common],float)
+                  b=np.array([p["coef"][g] for g in common],float)
+                  rho=spearmanr(a,b).statistic
+                  if np.isfinite(rho): vals.append(float(rho))
+              if not vals:return None
+              return {"n_profiles":len(vals),"median":float(np.median(vals)),"mean":float(np.mean(vals)),
+                      "max":float(np.max(vals)),"q90":float(np.quantile(vals,.9))}
+
+          recs=[]
+          for p in sorted(pairs,key=lambda z:(z["drug"].lower(),z["source"])):
+              profs=lincs_profiles(p["drug"])
+              if not profs: continue
+              R=cds_top500(p["response_id"]); N=cds_top500(p["nonresponse_id"])
+              print("CDS_SIZE",p["drug"],len(R or {}),len(N or {}))
+              if not R or not N: continue
+              rs=score(R,profs); ns=score(N,profs)
+              if not rs or not ns: continue
+              rec={**p,"response":rs,"nonresponse":ns,
+                   "delta_median":rs["median"]-ns["median"],
+                   "delta_mean":rs["mean"]-ns["mean"],
+                   "delta_max":rs["max"]-ns["max"],
+                   "delta_q90":rs["q90"]-ns["q90"]}
+              recs.append(rec); print("PAIR",json.dumps(rec,ensure_ascii=False))
+
+          def stats(key):
+              a=np.array([r[key] for r in recs],float)
+              if not len(a):return {"n":0}
+              pos=int((a>0).sum()); neg=int((a<0).sum())
+              o={"n":len(a),"median":float(np.median(a)),"mean":float(np.mean(a)),
+                 "positive":pos,"negative":neg,"zero":int((a==0).sum())}
+              if pos+neg:o["sign_p"]=float(binomtest(pos,pos+neg,.5).pvalue)
+              if len(a)>=2 and np.any(a!=0):
+                  try:o["wilcoxon_p"]=float(wilcoxon(a).pvalue)
+                  except Exception as e:o["wilcoxon_error"]=repr(e)
+              return o
+          out={"strict_pairs":len(pairs),"complete_pairs":len(recs),
+               "PRIMARY_delta_median_rho":stats("delta_median"),
+               "SECONDARY_delta_mean_rho":stats("delta_mean"),
+               "SECONDARY_delta_max_rho":stats("delta_max"),
+               "SECONDARY_delta_q90_rho":stats("delta_q90")}
+          print("=== O04_TOP500_RESULT ===")
+          print(json.dumps(out,indent=2))
+          print("RECORDS",json.dumps(recs,ensure_ascii=False,indent=2))
+          PY
