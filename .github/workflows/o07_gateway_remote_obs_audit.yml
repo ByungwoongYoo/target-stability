@@ -1,0 +1,95 @@
+name: O07 Gateway remote obs audit
+
+on:
+  push:
+    branches:
+      - o07-gateway-brain-concordance-20260919
+
+jobs:
+  obs_audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install fsspec aiohttp h5py pandas numpy requests
+      - name: Read Gateway H5AD obs remotely
+        shell: bash
+        run: |
+          mkdir -p o07_obs
+          python - <<'PY'
+          import fsspec,h5py,numpy as np,pandas as pd,json
+          from pathlib import Path
+          URL="https://datasets.cellxgene.cziscience.com/1ff1c9c1-c51a-41ad-a980-f6502ecbe949.h5ad"
+          OUT=Path("o07_obs")
+          def decode_arr(a):
+              if hasattr(a,"dtype") and a.dtype.kind in "SO":
+                  return np.array([x.decode() if isinstance(x,(bytes,bytearray)) else str(x) for x in a])
+              return np.asarray(a)
+          def read_col(g,key):
+              obj=g[key]
+              if isinstance(obj,h5py.Dataset):
+                  return decode_arr(obj[...])
+              # AnnData categorical: group with codes/categories
+              if isinstance(obj,h5py.Group) and "codes" in obj and "categories" in obj:
+                  codes=np.asarray(obj["codes"][...])
+                  cats=decode_arr(obj["categories"][...])
+                  out=np.empty(len(codes),dtype=object)
+                  good=codes>=0
+                  out[~good]=None
+                  out[good]=cats[codes[good]]
+                  return out
+              raise RuntimeError(f"Unsupported obs encoding for {key}: {list(obj.keys()) if isinstance(obj,h5py.Group) else type(obj)}")
+          with fsspec.open(URL,"rb",block_size=8*1024*1024,cache_type="readahead") as f:
+              with h5py.File(f,"r") as h:
+                  print("ROOT_KEYS",list(h.keys()))
+                  obs=h["obs"]
+                  print("OBS_KEYS",list(obs.keys()))
+                  wanted=["donor_id","disease","cell_type","sample_id","sex","development_stage","tissue","assay"]
+                  data={}
+                  for k in wanted:
+                      if k in obs:
+                          arr=read_col(obs,k)
+                          data[k]=arr
+                          print("COL",k,len(arr),"UNIQUE",len(pd.Series(arr).dropna().unique()))
+                          print("TOP",k,json.dumps(pd.Series(arr).value_counts(dropna=False).head(100).to_dict(),ensure_ascii=False))
+                  df=pd.DataFrame(data)
+                  # core counts
+                  print("ROWS",len(df))
+                  print("DONORS_TOTAL",df.donor_id.nunique() if "donor_id" in df else None)
+                  if {"disease","donor_id"}.issubset(df):
+                      donor_dis=df[["donor_id","disease"]].drop_duplicates()
+                      print("DONOR_DISEASE",json.dumps(donor_dis.disease.value_counts().to_dict(),ensure_ascii=False))
+                      cross=donor_dis.groupby("donor_id").disease.nunique()
+                      print("DONORS_MULTI_DISEASE",int((cross>1).sum()))
+                  if {"disease","cell_type"}.issubset(df):
+                      ct=pd.crosstab(df.disease,df.cell_type)
+                      # save full, print disease x top key relevant types
+                      ct.to_csv(OUT/"disease_by_cell_type.csv")
+                      rel=[c for c in ct.columns if "olfactory" in str(c).lower() or "neuron" in str(c).lower() or "globose" in str(c).lower()]
+                      print("RELEVANT_CELL_TYPES",json.dumps(rel,ensure_ascii=False))
+                      print("DISEASE_X_RELEVANT",ct[rel].to_json())
+                  if {"disease","donor_id","cell_type"}.issubset(df):
+                      mask=df.cell_type.astype(str).str.contains("ciliated olfactory receptor neuron",case=False,na=False)
+                      osn=df.loc[mask]
+                      print("OSN_CELLS",len(osn))
+                      print("OSN_BY_DISEASE",json.dumps(osn.disease.value_counts().to_dict(),ensure_ascii=False))
+                      od=osn[["donor_id","disease"]].drop_duplicates()
+                      print("OSN_DONORS_BY_DISEASE",json.dumps(od.disease.value_counts().to_dict(),ensure_ascii=False))
+                      per=osn.groupby(["disease","donor_id"]).size().reset_index(name="n_cells")
+                      print("OSN_PER_DONOR",per.groupby("disease").n_cells.agg(["count","median","mean","min","max"]).to_json())
+                      per.to_csv(OUT/"osn_cells_per_donor.csv",index=False)
+                  # compact donor summary
+                  if {"donor_id","disease"}.issubset(df):
+                      cols=[c for c in ["donor_id","disease","sex","development_stage"] if c in df]
+                      dd=df[cols].drop_duplicates()
+                      dd.to_csv(OUT/"donor_metadata_unique.csv",index=False)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o07-gateway-obs-audit
+          path: o07_obs/
+          retention-days: 5
