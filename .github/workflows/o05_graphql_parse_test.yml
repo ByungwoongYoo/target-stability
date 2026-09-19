@@ -1,0 +1,52 @@
+name: O05 GraphQL and table parse test
+
+on:
+  push:
+    branches: [o05-kinase-clinical-concordance-20260919]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install pandas openpyxl requests
+      - shell: bash
+        run: |
+          python - <<'PY'
+          import io,json,re,requests,pandas as pd
+          H={"User-Agent":"Mozilla/5.0"}
+          gql="https://civicdb.org/api/graphql"
+          for typ in ["EvidenceType","EvidenceStatusFilter","EvidenceLevel","EvidenceDirection","EvidenceSignificance"]:
+              q='''query E($n:String!){ __type(name:$n){ enumValues { name } } }'''
+              r=requests.post(gql,json={"query":q,"variables":{"n":typ}},headers=H,timeout=120)
+              print("ENUM",typ,r.status_code,r.text)
+          q='''query {
+            evidenceItems(evidenceType: PREDICTIVE, status: ACCEPTED, first: 5) {
+              totalCount
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                id name evidenceLevel evidenceType evidenceDirection significance status variantHgvs
+                molecularProfile { name rawName isMultiVariant }
+                therapies { name }
+                disease { name displayName }
+              }
+            }
+          }'''
+          r=requests.post(gql,json={"query":q},headers=H,timeout=120)
+          print("TEST_QUERY",r.status_code,r.text[:30000])
+
+          u="https://static-content.springer.com/esm/art%3A10.1038%2Fs41587-026-03090-8/MediaObjects/41587_2026_3090_MOESM4_ESM.xlsx"
+          b=requests.get(u,headers=H,timeout=240).content
+          for sh,key in [("Table S11","RBC Name"),("Table S12","Kinase"),("Table S13","Compound")]:
+              raw=pd.read_excel(io.BytesIO(b),sheet_name=sh,header=None,nrows=40)
+              hits=[]
+              for i,row in raw.iterrows():
+                  if str(row.iloc[0]).strip()==key: hits.append(i)
+              print("HEADER_HITS",sh,key,hits)
+              if hits:
+                  d=pd.read_excel(io.BytesIO(b),sheet_name=sh,header=hits[0])
+                  print("PARSED",sh,"SHAPE",d.shape,"COLS",json.dumps([str(x) for x in d.columns[:30]]))
+                  print("PARSED_HEAD",sh,d.head(8).to_json(orient="records",default_handler=str)[:20000])
+          PY
