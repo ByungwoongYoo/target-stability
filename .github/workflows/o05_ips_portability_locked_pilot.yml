@@ -1,0 +1,191 @@
+name: O05 locked iPSC perturbation portability pilot
+
+on:
+  push:
+    branches:
+      - o05-ips-perturb-portability-20260919
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas scipy numpy
+      - name: Run locked cross-atlas portability pilot
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p o05_pilot
+          echo "Downloading population-scale processed LFC matrix..."
+          curl -L --fail --retry 5 --retry-delay 3             -o /tmp/population_lfc.tsv.gz             https://ndownloader.figshare.com/files/49291654
+          ls -lh /tmp/population_lfc.tsv.gz
+
+          echo "Streaming source-defined trans-effect aggregation..."
+          gzip -dc /tmp/population_lfc.tsv.gz |           awk -F'\t' 'BEGIN{OFS="\t"}
+            NR==1 {next}
+            {
+              t=$1; g=$2; lfc=$4+0; p=$5+0;
+              seen[t]=1;
+              if (t != g && p < 0.1 && (lfc > 0.1 || lfc < -0.1)) sig[t]++;
+            }
+            END {
+              print "target","n_trans";
+              for (t in seen) print t,(t in sig ? sig[t] : 0);
+            }' > o05_pilot/population_target_ntrans.tsv
+
+          cat > /tmp/analyze_o05.py <<'PY'
+          import io,json,math,hashlib,requests
+          import numpy as np,pandas as pd
+          from scipy.stats import mannwhitneyu,fisher_exact,spearmanr
+
+          H={"User-Agent":"o05-portability/0.3"}
+          pop=pd.read_csv("o05_pilot/population_target_ntrans.tsv",sep="\t")
+          pop["target"]=pop.target.astype(str)
+          pop["n_trans"]=pd.to_numeric(pop.n_trans,errors="coerce").fillna(0).astype(int)
+
+          # Published checksum for the genome-scale population resource.
+          published_total=6674
+          published_with_effect=3374
+          published_mean=2.57
+          observed_total=len(pop)
+          observed_with_effect=int((pop.n_trans>0).sum())
+          observed_mean=float(pop.n_trans.mean())
+          checksum={
+            "published_total":published_total,
+            "observed_total":observed_total,
+            "published_with_effect":published_with_effect,
+            "observed_with_effect":observed_with_effect,
+            "published_fraction":published_with_effect/published_total,
+            "observed_fraction":observed_with_effect/observed_total if observed_total else None,
+            "published_mean_n_trans":published_mean,
+            "observed_mean_n_trans":observed_mean
+          }
+          print("CHECKSUM",json.dumps(checksum))
+          # Exact total may differ by one due to target-name normalization; require close agreement.
+          if abs(observed_total-published_total)>5:
+              raise RuntimeError(f"Population target count checksum failed: {observed_total} vs {published_total}")
+          if abs(observed_with_effect-published_with_effect)>50:
+              raise RuntimeError(f"Population effect-count checksum failed: {observed_with_effect} vs {published_with_effect}")
+          if abs(observed_mean-published_mean)>0.15:
+              raise RuntimeError(f"Population mean n_trans checksum failed: {observed_mean} vs {published_mean}")
+
+          # KOLF full perturbation universe.
+          ku="https://raw.githubusercontent.com/y-doctor/KOLF2.1J_Perturbation_Cell_Atlas/main/docs/data/perts/index.json"
+          kfull=requests.get(ku,headers=H,timeout=120); kfull.raise_for_status()
+          ko=kfull.json()
+          full=set(map(str,ko["perts"]))
+
+          # KOLF source-defined strong perturbations with effect magnitudes.
+          mu="https://raw.githubusercontent.com/y-doctor/KOLF2.1J_Perturbation_Cell_Atlas/main/docs/data/mde.json"
+          mr=requests.get(mu,headers=H,timeout=120); mr.raise_for_status()
+          pts=pd.DataFrame(mr.json()["points"]).rename(columns={"g":"target","n":"kolf_n_degs","e":"kolf_edist"})
+          pts["target"]=pts.target.astype(str)
+          strong=set(pts.target)
+          assert len(strong)==1655, len(strong)
+
+          d=pop[pop.target.isin(full)].copy()
+          d["kolf_strong"]=d.target.isin(strong)
+          common_total=len(d)
+          strong_n=int(d.kolf_strong.sum())
+          nonstrong_n=int((~d.kolf_strong).sum())
+          if strong_n<500 or nonstrong_n<1000:
+              raise RuntimeError(f"Insufficient common targets strong={strong_n} nonstrong={nonstrong_n}")
+
+          a=d.loc[d.kolf_strong,"n_trans"].to_numpy()
+          b=d.loc[~d.kolf_strong,"n_trans"].to_numpy()
+          U,p_mw=mannwhitneyu(a,b,alternative="two-sided")
+          # AUC / probability strong target has larger n_trans than non-strong (ties half).
+          auc=float(U/(len(a)*len(b)))
+
+          a_ev=int((a>0).sum()); b_ev=int((b>0).sum())
+          OR,p_f=fisher_exact([[a_ev,len(a)-a_ev],[b_ev,len(b)-b_ev]],alternative="two-sided")
+
+          # Correlations among KOLF strong perturbations present in population atlas.
+          ds=d[d.kolf_strong].merge(pts[["target","kolf_n_degs","kolf_edist"]],on="target",how="left")
+          rho_deg,p_deg=spearmanr(ds.kolf_n_degs,ds.n_trans)
+          rho_ed,p_ed=spearmanr(ds.kolf_edist,ds.n_trans)
+
+          # Gene bootstrap CIs for correlations.
+          rng=np.random.default_rng(20260919)
+          boots_deg=[];boots_ed=[]
+          n=len(ds)
+          for _ in range(1500):
+              ix=rng.integers(0,n,n)
+              z=ds.iloc[ix]
+              r1=spearmanr(z.kolf_n_degs,z.n_trans).statistic
+              r2=spearmanr(z.kolf_edist,z.n_trans).statistic
+              if np.isfinite(r1):boots_deg.append(r1)
+              if np.isfinite(r2):boots_ed.append(r2)
+          ci_deg=np.quantile(boots_deg,[.025,.975]).tolist()
+          ci_ed=np.quantile(boots_ed,[.025,.975]).tolist()
+
+          # Pre-specified descriptive concentration: population top decile n_trans.
+          q90=float(d.n_trans.quantile(.90))
+          d["pop_top10"]=d.n_trans>=q90
+          se=int((d.kolf_strong & d.pop_top10).sum())
+          sn=int(d.kolf_strong.sum())
+          ne=int((~d.kolf_strong & d.pop_top10).sum())
+          nn=int((~d.kolf_strong).sum())
+          OR_top,p_top=fisher_exact([[se,sn-se],[ne,nn-ne]],alternative="two-sided")
+
+          # Lists useful for later prior-art/biological audit; no hit claims yet.
+          discordant_kolf=(ds.sort_values(["kolf_n_degs","n_trans"],ascending=[False,True])
+                             [["target","kolf_n_degs","kolf_edist","n_trans"]].head(30)
+                             .to_dict("records"))
+          pop_high_not_kolf=(d[~d.kolf_strong].sort_values("n_trans",ascending=False)
+                              [["target","n_trans"]].head(30).to_dict("records"))
+
+          result={
+            "source_definition":{"padj_lt":0.1,"abs_lfc_gt":0.1,"exclude_on_target":True},
+            "checksum":checksum,
+            "kolf":{"full_perts":len(full),"strong_perts":len(strong)},
+            "common":{"n":common_total,"strong_n":strong_n,"nonstrong_n":nonstrong_n},
+            "primary":{
+              "strong_ntrans_median":float(np.median(a)),
+              "nonstrong_ntrans_median":float(np.median(b)),
+              "strong_ntrans_mean":float(np.mean(a)),
+              "nonstrong_ntrans_mean":float(np.mean(b)),
+              "mannwhitney_p":float(p_mw),
+              "auc_probability_superiority":auc,
+              "strong_has_trans":a_ev,
+              "strong_total":len(a),
+              "nonstrong_has_trans":b_ev,
+              "nonstrong_total":len(b),
+              "has_trans_OR":float(OR),
+              "has_trans_fisher_p":float(p_f)
+            },
+            "within_kolf_strong":{
+              "n":n,
+              "rho_kolf_nDEGs_vs_population_ntrans":float(rho_deg),
+              "p":float(p_deg),
+              "bootstrap95":[float(ci_deg[0]),float(ci_deg[1])],
+              "rho_kolf_edist_vs_population_ntrans":float(rho_ed),
+              "p_edist":float(p_ed),
+              "bootstrap95_edist":[float(ci_ed[0]),float(ci_ed[1])]
+            },
+            "top10_population":{
+              "threshold_ntrans":q90,
+              "strong_top10":se,"strong_total":sn,
+              "nonstrong_top10":ne,"nonstrong_total":nn,
+              "OR":float(OR_top),"p":float(p_top)
+            },
+            "discordant_kolf_strong_examples":discordant_kolf,
+            "population_high_not_kolf_examples":pop_high_not_kolf
+          }
+          payload=json.dumps(result,indent=2,default=str)
+          print("=== O05_PORTABILITY_RESULT ===")
+          print(payload)
+          open("o05_pilot/result.json","w").write(payload)
+          d.to_csv("o05_pilot/common_target_summary.tsv",sep="\t",index=False)
+          PY
+          python /tmp/analyze_o05.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o05-portability-pilot
+          path: o05_pilot/
+          retention-days: 5
