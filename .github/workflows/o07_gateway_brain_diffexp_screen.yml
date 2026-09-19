@@ -1,0 +1,104 @@
+name: O07 Gateway brain diffexp API screen
+
+on:
+  push:
+    branches:
+      - o07-gateway-brain-concordance-20260919
+
+jobs:
+  diffexp_screen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy scipy
+      - name: Probe schemas and run Gateway exploratory DE
+        shell: bash
+        run: |
+          mkdir -p o07_diffexp
+          cat > /tmp/o07_diffexp.py <<'PY'
+          import requests,json,time
+          from pathlib import Path
+          OUT=Path("o07_diffexp")
+          H={"User-Agent":"o07-gateway-validation/0.1","Accept":"application/json"}
+          ids={
+            "gateway":"16c13603-a36e-467a-a8e8-3d118f2eef45",
+            "seaad_mtg_whole":"c2876b1b-06d8-4d96-a56b-5304f815b99a",
+            "seaad_dlpfc_whole":"6f7fd0f1-a2ed-4ff1-80d3-33dde731cbc3",
+            "pd_da":"2856d06c-0ff9-4e01-bfc9-202b74d0b60f",
+            "pd_multiregion":"d3cb449b-c2b1-4b50-a7f1-21203535fe61"
+          }
+          def base(dsid): return f"https://cellxgene.cziscience.com/e/{dsid}.cxg/api/v0.2"
+          def get_json(url):
+              for a in range(4):
+                  try:
+                      r=requests.get(url,headers=H,timeout=90)
+                      print("GET",url,r.status_code,len(r.content),r.headers.get("content-type"))
+                      if r.status_code<500:
+                          r.raise_for_status(); return r.json()
+                  except Exception as e: print("GET_ERR",repr(e))
+                  time.sleep(2*(a+1))
+              return None
+          schemas={}
+          for name,dsid in ids.items():
+              s=get_json(base(dsid)+"/schema")
+              schemas[name]=s
+              if s:
+                  OUT.joinpath(f"{name}_schema.json").write_text(json.dumps(s,indent=2),encoding="utf-8")
+                  obs=((s.get("schema") or {}).get("annotations") or {}).get("obs") or []
+                  print("SCHEMA",name,"NOBS",((s.get("schema") or {}).get("dataframe") or {}).get("nObs"),
+                        "NVAR",((s.get("schema") or {}).get("dataframe") or {}).get("nVar"))
+                  for x in obs:
+                      n=x.get("name","")
+                      if any(k in n.lower() for k in ["disease","cell","class","subclass","cluster","donor","sex","age","braak","cog","pathol","sample"]):
+                          cats=x.get("categories")
+                          print("OBS_FIELD",name,n,x.get("type"),json.dumps(cats,ensure_ascii=False)[:12000] if cats is not None else "")
+          def diff(name,set1_ann,set2_ann,count=500):
+              dsid=ids[name]
+              payload={
+                "mode":"topN","count":count,
+                "set1":{"filter":{"obs":{"annotation_value":[{"name":k,"values":[v] if not isinstance(v,list) else v} for k,v in set1_ann.items()]}}},
+                "set2":{"filter":{"obs":{"annotation_value":[{"name":k,"values":[v] if not isinstance(v,list) else v} for k,v in set2_ann.items()]}}}
+              }
+              u=base(dsid)+"/diffexp/obs"
+              for a in range(3):
+                  try:
+                      r=requests.post(u,json=payload,headers=H,timeout=180)
+                      print("DIFF",name,r.status_code,len(r.content),r.text[:1000])
+                      if r.status_code==200:
+                          o=r.json()
+                          OUT.joinpath(f"{name}_diff.json").write_text(json.dumps(o,indent=2),encoding="utf-8")
+                          print("DIFF_COUNTS",name,len(o.get("positive",[])),len(o.get("negative",[])))
+                          print("DIFF_POS_HEAD",name,json.dumps(o.get("positive",[])[:15]))
+                          print("DIFF_NEG_HEAD",name,json.dumps(o.get("negative",[])[:15]))
+                          return o
+                      if r.status_code<500: return None
+                  except Exception as e: print("DIFF_ERR",name,repr(e))
+                  time.sleep(3*(a+1))
+              return None
+          # Exploratory server-DE screen only; donor-level pseudobulk is required before any claim.
+          diff("gateway",
+               {"disease":"Alzheimer disease","cell_type":"ciliated olfactory receptor neuron"},
+               {"disease":"normal","cell_type":"ciliated olfactory receptor neuron"})
+          diff("gateway",
+               {"disease":"Parkinson disease","cell_type":"ciliated olfactory receptor neuron"},
+               {"disease":"normal","cell_type":"ciliated olfactory receptor neuron"})
+          # PD DA dataset is pre-restricted to dopamine neurons; try disease-only if categories support it.
+          s=schemas.get("pd_da") or {}
+          obs=((s.get("schema") or {}).get("annotations") or {}).get("obs") or []
+          dis=next((x for x in obs if x.get("name")=="disease"),None)
+          cats=(dis or {}).get("categories") or []
+          print("PD_DA_DISEASE_CATS",json.dumps(cats,ensure_ascii=False))
+          if "Parkinson disease" in cats and "normal" in cats:
+              diff("pd_da",{"disease":"Parkinson disease"},{"disease":"normal"})
+          PY
+          python /tmp/o07_diffexp.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o07-gateway-brain-diffexp-screen
+          path: o07_diffexp/
+          retention-days: 5
