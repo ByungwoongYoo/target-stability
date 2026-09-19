@@ -63,10 +63,11 @@ for p in sorted(extract.glob("*.gz")):
 
     if first_ids is None:
         first_ids=[str(x) for x in df.index[:100]]
-    if gene_map is None:
-        gene_map,gene_map_info=map_genes(df.index)
-        # save only BMP-relevant mapping + first identifiers
-        pd.DataFrame({"raw_id":list(gene_map.keys()),"symbol":list(gene_map.values())}).to_csv(OUT/"gene_map.tsv",sep="\t",index=False)
+    gene_map,gene_map_info=map_genes(df.index)
+    safe_name=re.sub(r"[^A-Za-z0-9._-]+","_",p.name)
+    pd.DataFrame({"raw_id":list(gene_map.keys()),"symbol":list(gene_map.values())}).to_csv(
+        OUT/f"{safe_name}.gene_map.tsv",sep="\t",index=False
+    )
 
     sym_to_raw={}
     for raw,sym in gene_map.items():
