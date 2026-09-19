@@ -1,0 +1,66 @@
+name: O05 iPSC perturb portability data probe
+
+on:
+  push:
+    branches:
+      - o05-ips-perturb-portability-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas scipy
+      - name: Probe public summary files
+        shell: bash
+        run: |
+          mkdir -p o05_probe
+          cat > /tmp/o05_probe.py <<'PY'
+          import json, requests, re, hashlib
+          from pathlib import Path
+          OUT=Path("o05_probe")
+          H={"User-Agent":"o05-portability/0.1"}
+
+          # KOLF web summary
+          ku="https://raw.githubusercontent.com/y-doctor/KOLF2.1J_Perturbation_Cell_Atlas/main/docs/data/mde.json"
+          r=requests.get(ku,headers=H,timeout=120); print("KOLF",r.status_code,len(r.content)); r.raise_for_status()
+          (OUT/"kolf_mde.json").write_bytes(r.content)
+          k=r.json()
+          pts=k.get("points",[])
+          print("KOLF_POINTS",len(pts))
+          print("KOLF_KEYS",sorted(pts[0].keys()) if pts else [])
+          if pts:
+              import pandas as pd
+              df=pd.DataFrame(pts)
+              print("KOLF_N_DEGS_DESC",df["n"].describe().to_dict())
+              print("KOLF_EDIST_DESC",df["e"].describe().to_dict())
+              print("KOLF_HDB_CLUSTERED",int((df["h"]!=-1).sum()))
+              print("KOLF_SAMPLE",df.head(10).to_json(orient="records"))
+
+          # Official Figshare article for population-scale screen
+          api="https://api.figshare.com/v2/articles/26819743"
+          rr=requests.get(api,headers=H,timeout=120)
+          print("FIGSHARE_API",rr.status_code,len(rr.content),rr.url)
+          rr.raise_for_status()
+          obj=rr.json()
+          (OUT/"figshare_article.json").write_text(json.dumps(obj,indent=2),encoding="utf-8")
+          files=obj.get("files",[])
+          print("FIGSHARE_TITLE",obj.get("title"))
+          print("FIGSHARE_FILES_N",len(files))
+          for f in files:
+              print("FILE",json.dumps({
+                "id":f.get("id"),"name":f.get("name"),"size":f.get("size"),
+                "download_url":f.get("download_url"),"computed_md5":f.get("computed_md5")
+              }))
+          PY
+          python /tmp/o05_probe.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o05-portability-probe
+          path: o05_probe/
+          retention-days: 3
