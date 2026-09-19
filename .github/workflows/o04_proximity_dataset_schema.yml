@@ -1,0 +1,55 @@
+name: O04 proximity dataset schema
+
+on:
+  push:
+    branches:
+      - o04-proximity-normal-andgate-20260919
+
+jobs:
+  schema:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl pyarrow
+      - name: Inspect Zenodo dataset zip
+        run: |
+          cat > /tmp/o04_schema.py <<'PY'
+          import io, zipfile, json, re
+          import requests, pandas as pd
+          url="https://zenodo.org/api/records/21678744/files/Proximity-Guided%20Graph%20Learning%20Reveals%20Tumor-Associated%20Proximity%20Antigens%20-%20Dataset.zip/content"
+          r=requests.get(url,timeout=300,headers={"User-Agent":"o04-schema/0.1"})
+          print("GET",r.status_code,len(r.content),r.headers.get("content-type")); r.raise_for_status()
+          z=zipfile.ZipFile(io.BytesIO(r.content))
+          names=z.namelist()
+          print("ZIP_NAMES",json.dumps(names,indent=2))
+          for n in names:
+              if n.endswith("/") or n.startswith("__MACOSX"): continue
+              low=n.lower()
+              if not re.search(r'\.(csv|tsv|xlsx|xls|parquet)$',low): continue
+              data=z.read(n)
+              print("\n=== FILE",n,"BYTES",len(data),"===")
+              try:
+                  if low.endswith((".xlsx",".xls")):
+                      xf=pd.ExcelFile(io.BytesIO(data))
+                      print("SHEETS",xf.sheet_names)
+                      for sh in xf.sheet_names[:20]:
+                          df=pd.read_excel(io.BytesIO(data),sheet_name=sh,nrows=5)
+                          print("SHEET",sh,"COLS",json.dumps([str(c) for c in df.columns]))
+                          print("HEAD",df.head(2).to_json(orient="records",default_handler=str)[:6000])
+                  elif low.endswith(".parquet"):
+                      df=pd.read_parquet(io.BytesIO(data))
+                      print("SHAPE",df.shape,"COLS",json.dumps([str(c) for c in df.columns]))
+                      print("HEAD",df.head(2).to_json(orient="records",default_handler=str)[:6000])
+                  else:
+                      sep="\t" if low.endswith(".tsv") else ","
+                      df=pd.read_csv(io.BytesIO(data),sep=sep,nrows=5)
+                      print("COLS",json.dumps([str(c) for c in df.columns]))
+                      print("HEAD",df.head(2).to_json(orient="records",default_handler=str)[:6000])
+              except Exception as e:
+                  print("ERR",repr(e))
+          PY
+          python /tmp/o04_schema.py
