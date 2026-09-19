@@ -1,0 +1,291 @@
+name: O01 locked q10 clinical endpoint orientation correction
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  q10_endpoint_correction:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl scipy pyarrow statsmodels
+      - name: Run locked q10 endpoint correction
+        shell: bash
+        run: |
+          cat > /tmp/o01_q10_endpoint_correction.py <<'PY'
+          import io,json,zipfile,time,urllib.parse,xml.etree.ElementTree as ET,hashlib
+          import requests,pandas as pd,numpy as np,pyarrow.parquet as pq
+          from scipy.stats import spearmanr,pearsonr,fisher_exact
+          import statsmodels.api as sm
+          from statsmodels.formula.api import glm
+
+          BB="https://depmap.org/portal/breadbox"
+          DSID="fa1b635a-5116-4a93-b66d-84eca7e2a402"
+          S3="https://open-targets-public-data-releases.s3.amazonaws.com/"
+          NS={"s3":"http://s3.amazonaws.com/doc/2006-03-01/"}
+          H={"User-Agent":"o01-crc-definitive/0.1 (+https://github.com/ByungwoongYoo/target-stability)","Accept":"application/json"}
+
+          def req(method,url,**kw):
+              h=H.copy(); h.update(kw.pop("headers",{})); err=None
+              for a in range(6):
+                  try:
+                      r=requests.request(method,url,headers=h,timeout=240,**kw)
+                      if r.status_code<500:
+                          r.raise_for_status(); return r
+                      err=RuntimeError(f"HTTP {r.status_code}")
+                  except Exception as e: err=e
+                  time.sleep(2*(a+1))
+              raise err
+          def bget(ep): return req("GET",BB+"/"+ep.lstrip("/")).json()
+          def bpost(ep,body): return req("POST",BB+"/"+ep.lstrip("/"),json=body).json()
+          def frame(raw):
+              ids=set()
+              for v in raw.values():
+                  if isinstance(v,dict): ids.update(map(str,v.keys()))
+              out=[]
+              for i in sorted(ids):
+                  row={"screen_id":i}
+                  for k,v in raw.items():
+                      if isinstance(v,dict): row[k]=v.get(i)
+                  out.append(row)
+              return pd.DataFrame(out)
+          def truth(s): return s.astype(str).str.lower().isin(["true","yes","1","y"])
+
+          # Exact Broad paper screen definitions, CRC only
+          md=frame(bpost("datasets/tabular/screen_nextgen_metadata",{"columns":[
+              "ModelID","OncotreeLineage","IsNextGen","IsAdherent2D","ScreenType"
+          ]}))
+          matrix_ids=set(str(x["id"]) for x in bget(f"datasets/samples/{DSID}"))
+          md=md[md.screen_id.astype(str).isin(matrix_ids)].copy()
+          crc=md.OncotreeLineage.astype(str).str.lower().str.contains(r"colorectal|colon|rect|bowel",regex=True)
+          broad3=md[crc & truth(md.IsNextGen) & md.ScreenType.astype(str).eq("3DO")].copy()
+          broad2=md[crc & truth(md.IsAdherent2D)].copy()
+          print("BROAD_SCREEN_COUNTS",len(broad3),len(broad2))
+
+          features=bget(f"datasets/features/{DSID}")
+          fmap={str(x["id"]):str(x["label"]) for x in features}
+          def agg(ids,name):
+              o=bpost(f"datasets/matrix/{DSID}",{
+                  "sample_identifier":"id","samples":sorted(set(map(str,ids))),
+                  "aggregate":{"aggregate_by":"samples","aggregation":"mean"}
+              })
+              return pd.DataFrame({"gene":[fmap.get(str(k),str(k)) for k in o["mean"]],
+                                   name:list(o["mean"].values())})
+          b3=agg(broad3.screen_id,"BroadCRC3D")
+          b2=agg(broad2.screen_id,"BroadCRC2D")
+
+          # Restrict to Broad published Fig5 non-common-essential universe
+          figurl=("https://media.springernature.com/original/springer-static/esm/"
+                  "art%3A10.1038%2Fs41586-026-10843-7/MediaObjects/41586_2026_10843_MOESM12_ESM.xlsx")
+          fig=pd.read_excel(io.BytesIO(req("GET",figurl).content),sheet_name="Fig5b diff deps volcano")
+          allowed=set(fig.GeneSymbol.dropna().astype(str).str.strip())
+          b3=b3[b3.gene.astype(str).isin(allowed)]
+          b2=b2[b2.gene.astype(str).isin(allowed)]
+          print("FIG5_ALLOWED_GENES",len(allowed))
+
+          # Sanger CRC Broad-nonoverlap
+          surl=("https://static-content.springer.com/esm/art%3A10.1038%2Fs41586-026-10830-y/"
+                "MediaObjects/41586_2026_10830_MOESM3_ESM.zip")
+          z=zipfile.ZipFile(io.BytesIO(req("GET",surl).content))
+          smeta=pd.read_excel(io.BytesIO(z.read("supplementary_table_2_revision.xlsx")),sheet_name="data_availability")
+          t6=pd.read_csv(io.BytesIO(z.read("supplementary_table_6_revision.csv")),sep=r"\s+",engine="python",
+                         usecols=["sample_ID","gene","library","LFC"])
+          smeta["sample_ID"]=smeta.sample_ID.astype(str)
+          scr=smeta[smeta.CRISPR_available.astype(str).str.lower().eq("yes")].copy()
+          keep=set(scr.loc[
+              scr.primary_tumour_type.astype(str).str.lower().eq("colorectal") &
+              ~scr.overlap_Broad_DepMap.astype(str).str.lower().isin(["yes","true","1"]),
+              "sample_ID"].astype(str))
+          t6["sample_ID"]=t6.sample_ID.astype(str)
+          per=(t6[t6.sample_ID.isin(keep)].groupby(["sample_ID","gene"],as_index=False).agg(LFC=("LFC","mean")))
+          sg=per.groupby("gene",as_index=False).agg(SangerCRC3D=("LFC","mean"))
+          d=b3.merge(b2,on="gene").merge(sg,on="gene").dropna().copy()
+          for c in ["BroadCRC3D","BroadCRC2D","SangerCRC3D"]: d[c]=pd.to_numeric(d[c],errors="coerce")
+          d=d.dropna().copy()
+
+          rho3,p3=spearmanr(d.BroadCRC3D,d.SangerCRC3D)
+          rho2,p2=spearmanr(d.BroadCRC2D,d.SangerCRC3D)
+          r3,pr3=pearsonr(d.BroadCRC3D,d.SangerCRC3D)
+          r2,pr2=pearsonr(d.BroadCRC2D,d.SangerCRC3D)
+
+          # Bootstrap descriptive delta in Spearman (gene bootstrap)
+          rng=np.random.default_rng(20260919)
+          deltas=[]
+          n=len(d)
+          for _ in range(2000):
+              idx=rng.integers(0,n,n)
+              x=d.iloc[idx]
+              a=spearmanr(x.BroadCRC3D,x.SangerCRC3D).statistic
+              b=spearmanr(x.BroadCRC2D,x.SangerCRC3D).statistic
+              if np.isfinite(a) and np.isfinite(b): deltas.append(a-b)
+          dlo,dhi=np.quantile(deltas,[.025,.975])
+
+          # OT 26.06 helpers
+          def list_keys(prefix):
+              ks=[]; token=None
+              while True:
+                  params={"list-type":"2","prefix":prefix,"max-keys":"1000"}
+                  if token: params["continuation-token"]=token
+                  root=ET.fromstring(req("GET",S3,params=params).content)
+                  ks += [x.find("s3:Key",NS).text for x in root.findall("s3:Contents",NS)]
+                  if root.findtext("s3:IsTruncated",default="false",namespaces=NS)!="true": break
+                  token=root.findtext("s3:NextContinuationToken",default=None,namespaces=NS)
+              return ks
+          def read_ot(name,wanted):
+              fs=[]
+              for k in [k for k in list_keys(f"platform/26.06/output/{name}/") if k.endswith(".parquet")]:
+                  tab=pq.read_table(io.BytesIO(req("GET",S3+urllib.parse.quote(k,safe="/")).content))
+                  cols=[c for c in wanted if c in tab.schema.names]
+                  fs.append(tab.select(cols).to_pandas())
+              return pd.concat(fs,ignore_index=True)
+
+          targets=read_ot("target",["id","approvedSymbol"]).dropna(subset=["id","approvedSymbol"]).drop_duplicates("id")
+          ess=read_ot("target_essentiality",["id","geneEssentiality"])
+          def ef(v):
+              flags=[]
+              def walk(x):
+                  if isinstance(x,dict):
+                      if x.get("isEssential") is not None: flags.append(bool(x["isEssential"]))
+                      for y in x.values(): walk(y)
+                  elif isinstance(x,(list,tuple,np.ndarray)):
+                      for y in x: walk(y)
+              walk(v); return any(flags)
+          ess["isEssential"]=ess.geneEssentiality.map(ef)
+          esym=(ess.merge(targets,on="id",how="left").dropna(subset=["approvedSymbol"])
+                .groupby("approvedSymbol",as_index=False).agg(isEssential=("isEssential","max")))
+
+          diseases=read_ot("disease",["id","ancestors"])
+          CRCROOT="MONDO_0005575"
+          def is_crc(row):
+              if str(row.id)==CRCROOT: return True
+              v=row.ancestors
+              return isinstance(v,(list,tuple,np.ndarray)) and CRCROOT in [str(x) for x in v]
+          crc_ids=set(diseases.loc[diseases.apply(is_crc,axis=1),"id"].astype(str))
+          print("OT_CRC_DISEASE_IDS",len(crc_ids))
+
+          ev=read_ot("evidence_clinical_precedence",["targetId","diseaseId","clinicalStage","drugId"])
+          ev=ev[ev.diseaseId.astype(str).isin(crc_ids)].copy()
+          rank={"UNKNOWN":0.0,"PRECLINICAL":0.1,"IND":0.5,"EARLY_PHASE_1":0.75,
+                "PHASE_1":1.0,"PHASE_1_2":1.5,"PHASE_2":2.0,"PHASE_2_3":2.5,
+                "PHASE_3":3.0,"PREAPPROVAL":3.5,"APPROVAL":4.0,"PHASE_4":4.0,"WITHDRAWAL":4.0}
+          ev["stage"]=ev.clinicalStage.astype(str).map(rank).fillna(0)
+          mx=(ev.merge(targets,left_on="targetId",right_on="id",how="left")
+              .dropna(subset=["approvedSymbol"]).groupby("approvedSymbol",as_index=False)
+              .agg(max_stage=("stage","max")))
+
+          result={
+            "broad_crc_3d_screens":len(broad3),"broad_crc_2d_screens":len(broad2),
+            "sanger_crc_nonoverlap_models":len(keep),"shared_filtered_genes":len(d),
+            "correlation":{
+                "BroadCRC3D_vs_SangerCRC3D_spearman":float(rho3),
+                "BroadCRC2D_vs_SangerCRC3D_spearman":float(rho2),
+                "delta_spearman_3D_minus_2D":float(rho3-rho2),
+                "bootstrap95_delta":[float(dlo),float(dhi)],
+                "BroadCRC3D_vs_SangerCRC3D_pearson":float(r3),
+                "BroadCRC2D_vs_SangerCRC3D_pearson":float(r2)
+            },
+            "thresholds":{}
+          }
+
+          for q in [.10]:
+              z=d.copy()
+              z["b3"]=z.BroadCRC3D<=z.BroadCRC3D.quantile(q)
+              z["s3"]=z.SangerCRC3D<=z.SangerCRC3D.quantile(q)
+              z["b2"]=z.BroadCRC2D<=z.BroadCRC2D.quantile(q)
+              a=int((z.b3&z.s3).sum()); b=int(z.b3.sum()-a); c=int(z.s3.sum()-a); dd=int(len(z)-a-b-c)
+              oor,op=fisher_exact([[a,b],[c,dd]],alternative="greater")
+              z["subclass"]=np.select(
+                  [z.b2&z.b3&z.s3, ~z.b2&z.b3&z.s3, z.b2&~z.b3&~z.s3],
+                  ["UNIVERSAL_2D_BOTH3D","THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY"],default="OTHER")
+              g=z[z.subclass.isin(["UNIVERSAL_2D_BOTH3D","THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY"])].copy()
+              g=g.merge(mx,left_on="gene",right_on="approvedSymbol",how="left").drop(columns=["approvedSymbol"],errors="ignore")
+              g=g.merge(esym,left_on="gene",right_on="approvedSymbol",how="left").drop(columns=["approvedSymbol"],errors="ignore")
+              g["max_stage"]=g.max_stage.fillna(0.0); g["isEssential"]=g.isEssential.fillna(False).astype(bool)
+              for ep,t in [("phase2plus",2),("phase3plus",3),("approval",4)]:
+                  g[f"{ep}_bool_audit_only"] = g.max_stage>=t
+                  g[ep] = (g.max_stage>=t).astype(int)
+
+              out={"two3_overlap":a,"broad3_n":int(z.b3.sum()),"sanger3_n":int(z.s3.sum()),
+                   "overlap_OR":float(oor),"overlap_p":float(op),
+                   "class_counts":g.subclass.value_counts().to_dict(),
+                   "clinical":[],"glm":{}}
+              def cmp(A,B,ep):
+                  x=g[g.subclass.eq(A)]; y=g[g.subclass.eq(B)]
+                  xe=int(x[ep].sum()); ye=int(y[ep].sum())
+                  OR,p=fisher_exact([[xe,len(x)-xe],[ye,len(y)-ye]],alternative="two-sided")
+                  return {"a":A,"b":B,"endpoint":ep,"a_n":len(x),"a_event":xe,
+                          "a_rate":xe/len(x) if len(x) else None,"b_n":len(y),"b_event":ye,
+                          "b_rate":ye/len(y) if len(y) else None,"OR":float(OR),"p":float(p)}
+              for ep in ["phase2plus","phase3plus","approval"]:
+                  out["clinical"].append(cmp("UNIVERSAL_2D_BOTH3D","TWO_D_ONLY",ep))
+                  out["clinical"].append(cmp("THREE_D_SPECIFIC_CONSENSUS","TWO_D_ONLY",ep))
+
+              uv=g[g.subclass.isin(["UNIVERSAL_2D_BOTH3D","TWO_D_ONLY"])].copy()
+              uv["replicated3d"]=uv.subclass.eq("UNIVERSAL_2D_BOTH3D").astype(int)
+              uv["essential_int"]=uv.isEssential.astype(int)
+              uv["b2_z"]=(uv.BroadCRC2D-uv.BroadCRC2D.mean())/(uv.BroadCRC2D.std(ddof=0) or 1)
+              # Locked correction contract: exact q10 comparison set and event counts.
+              cc=uv.subclass.value_counts().to_dict()
+              assert cc.get("UNIVERSAL_2D_BOTH3D",0)==645, cc
+              assert cc.get("TWO_D_ONLY",0)==349, cc
+              assert len(uv)==994, len(uv)
+              assert int(uv["phase2plus"].sum())==45, int(uv["phase2plus"].sum())
+              assert int(uv["phase3plus"].sum())==30, int(uv["phase3plus"].sum())
+              assert int(uv["approval"].sum())==3, int(uv["approval"].sum())
+
+              uv=uv.sort_values(["gene","subclass"]).reset_index(drop=True)
+              row_payload="\n".join(
+                  f"{r.gene}\t{r.subclass}\t{int(r.phase2plus)}\t{int(r.phase3plus)}\t{int(r.approval)}"
+                  for r in uv.itertuples()
+              )
+              out["locked_input_audit"]={
+                  "n":int(len(uv)),
+                  "class_counts":cc,
+                  "gene_endpoint_sha256":hashlib.sha256(row_payload.encode()).hexdigest(),
+                  "gene_order":uv.gene.astype(str).tolist(),
+                  "endpoint_vectors":{
+                      "phase2plus":uv.phase2plus.astype(int).tolist(),
+                      "phase3plus":uv.phase3plus.astype(int).tolist(),
+                      "approval":uv.approval.astype(int).tolist()
+                  },
+                  "events":{
+                      "phase2plus":int(uv.phase2plus.sum()),
+                      "phase3plus":int(uv.phase3plus.sum()),
+                      "approval":int(uv.approval.sum())
+                  }
+              }
+              for ep in ["phase2plus","phase3plus","approval"]:
+                  try:
+                      # Critical correction: endpoint is explicit numeric 0/1, not Boolean categorical.
+                      assert set(uv[ep].unique()).issubset({0,1})
+                      m=glm(f"{ep} ~ replicated3d + b2_z + essential_int",data=uv,family=sm.families.Binomial()).fit()
+                      bb=float(m.params["replicated3d"]); se=float(m.bse["replicated3d"])
+                      out["glm"][ep]={
+                                      "endog_name":str(m.model.endog_names),
+                                      "endog_unique":sorted(set(float(x) for x in np.asarray(m.model.endog).tolist())),
+                                      "OR_replicated3d":float(np.exp(bb)),
+                                      "CI95":[float(np.exp(bb-1.96*se)),float(np.exp(bb+1.96*se))],
+                                      "p":float(m.pvalues["replicated3d"]),
+                                      "coef_replicated3d":bb,
+                                      "se_replicated3d":se,
+                                      "p_2D_strength":float(m.pvalues.get("b2_z",np.nan)),
+                                      "p_essentiality":float(m.pvalues.get("essential_int",np.nan)),
+                                      "params":{str(k):float(v) for k,v in m.params.items()}
+                                      }
+                  except Exception as e: out["glm"][ep]={"error":repr(e)}
+              if q==.10:
+                  out["top_3d_specific"]=g[g.subclass.eq("THREE_D_SPECIFIC_CONSENSUS")][
+                      ["gene","BroadCRC3D","BroadCRC2D","SangerCRC3D","max_stage","isEssential"]
+                  ].sort_values(["max_stage","BroadCRC3D"],ascending=[False,True]).head(25).to_dict("records")
+              result["thresholds"][str(q)]=out
+
+          print("=== O01_Q10_ENDPOINT_CORRECTION_RESULT ===")
+          print(json.dumps(result,indent=2,default=str))
+          PY
+          python /tmp/o01_q10_endpoint_correction.py
