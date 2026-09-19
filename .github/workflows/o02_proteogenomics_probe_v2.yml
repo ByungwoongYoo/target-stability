@@ -1,0 +1,168 @@
+name: O02 proteogenomics probe v2
+
+on:
+  push:
+    branches:
+      - o02-cross-ancestry-proteogenomics-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install requests pandas openpyxl playwright
+          python -m playwright install --with-deps chromium
+      - name: Recover public supplementary files and inspect
+        shell: bash
+        run: |
+          mkdir -p o02_probe_v2
+          cat > /tmp/o02_probe_v2.py <<'PY'
+          import asyncio,json,re,hashlib,io,time
+          from pathlib import Path
+          import requests,pandas as pd
+          from playwright.async_api import async_playwright
+
+          OUT=Path("o02_probe_v2"); OUT.mkdir(exist_ok=True)
+          H={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"}
+
+          def get_retry(url,tries=6,timeout=180):
+              err=None
+              for a in range(tries):
+                  try:
+                      r=requests.get(url,headers=H,timeout=timeout,allow_redirects=True)
+                      print("GET",a,url,"STATUS",r.status_code,"CTYPE",r.headers.get("content-type"),"BYTES",len(r.content),"FINAL",r.url)
+                      if r.status_code==200: return r
+                      err=RuntimeError(f"HTTP {r.status_code}")
+                  except Exception as e: err=e
+                  time.sleep(2*(a+1))
+              raise err
+
+          eas_path=None
+          try:
+              api=get_retry("https://zenodo.org/api/records/21503247",tries=4,timeout=60).json()
+              slim=[]
+              for f in api.get("files",[]):
+                  slim.append({"key":f.get("key"),"size":f.get("size"),"links":f.get("links",{})})
+              print("ZENODO_FILES",json.dumps(slim,indent=2)[:20000])
+              f=next(x for x in api.get("files",[]) if x.get("key")=="Supplementary Tables.xlsx")
+              urls=[]
+              links=f.get("links",{})
+              for k in ["content","self","download"]:
+                  if links.get(k): urls.append(links[k])
+              urls += [
+                "https://zenodo.org/api/records/21503247/files/Supplementary%20Tables.xlsx/content",
+                "https://zenodo.org/records/21503247/files/Supplementary%20Tables.xlsx?download=1",
+              ]
+              for u in dict.fromkeys(urls):
+                  try:
+                      r=get_retry(u,tries=4,timeout=240)
+                      if r.content[:2]==b"PK" and len(r.content)>100000:
+                          eas_path=OUT/"EAS_Supplementary_Tables.xlsx"
+                          eas_path.write_bytes(r.content)
+                          print("EAS_SAVED",eas_path,len(r.content))
+                          break
+                  except Exception as e:
+                      print("EAS_URL_ERR",u,repr(e))
+          except Exception as e:
+              print("EAS_API_ERR",repr(e))
+
+          async def browser_recover():
+              nonlocal_holder={"eas":None,"eur":[]}
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context(accept_downloads=True,user_agent=H["User-Agent"])
+
+                  # EAS browser fallback
+                  if eas_path is None:
+                      pg=await ctx.new_page()
+                      try:
+                          await pg.goto("https://zenodo.org/records/21503247",wait_until="domcontentloaded",timeout=120000)
+                          await pg.wait_for_timeout(3000)
+                          links=await pg.locator("a").evaluate_all("""els=>els.map(e=>({text:(e.innerText||'').trim(),href:e.href||''}))""")
+                          cand=[x for x in links if "Supplementary Tables.xlsx" in x.get("text","") or "Supplementary%20Tables.xlsx" in x.get("href","")]
+                          print("EAS_BROWSER_LINKS",json.dumps(cand,indent=2))
+                          for x in cand:
+                              try:
+                                  rr=await ctx.request.get(x["href"],timeout=180000)
+                                  body=await rr.body()
+                                  print("EAS_BROWSER_GET",rr.status,len(body),rr.headers.get("content-type"))
+                                  if rr.status==200 and body[:2]==b"PK":
+                                      pth=OUT/"EAS_Supplementary_Tables.xlsx"; pth.write_bytes(body); nonlocal_holder["eas"]=str(pth); break
+                              except Exception as e: print("EAS_BROWSER_ERR",repr(e))
+                      except Exception as e: print("EAS_PAGE_ERR",repr(e))
+                      await pg.close()
+
+                  # EUR supplementary discovery
+                  pg=await ctx.new_page()
+                  try:
+                      url="https://www.medrxiv.org/content/10.64898/2026.07.23.26358667v1"
+                      await pg.goto(url,wait_until="domcontentloaded",timeout=120000)
+                      await pg.wait_for_timeout(3500)
+                      print("EUR_TITLE",await pg.title(),"EUR_URL",pg.url)
+                      links=await pg.locator("a").evaluate_all("""els=>els.map(e=>({text:(e.innerText||'').trim(),href:e.href||'',download:e.download||''}))""")
+                      cand=[x for x in links if re.search(r'supp|additional|\.xlsx|\.xls|\.zip|DC\d',json.dumps(x),re.I)]
+                      print("EUR_CANDIDATES",json.dumps(cand[:100],indent=2))
+                      (OUT/"eur_links.json").write_text(json.dumps(links,indent=2),encoding="utf-8")
+                      for i,x in enumerate(cand[:40]):
+                          u=x.get("href")
+                          if not u: continue
+                          try:
+                              rr=await ctx.request.get(u,timeout=180000)
+                              body=await rr.body(); ct=rr.headers.get("content-type","")
+                              print("EUR_GET",i,rr.status,ct,len(body),u)
+                              if rr.status==200 and len(body)>10000 and body[:2]==b"PK":
+                                  # could be xlsx or zip
+                                  ext=".xlsx"
+                                  if "zip" in ct.lower() or u.lower().endswith(".zip"): ext=".zip"
+                                  pth=OUT/f"EUR_supp_{i}{ext}"; pth.write_bytes(body); nonlocal_holder["eur"].append(str(pth))
+                          except Exception as e: print("EUR_GET_ERR",u,repr(e))
+                  except Exception as e: print("EUR_PAGE_ERR",repr(e))
+                  await pg.close()
+                  await b.close()
+              return nonlocal_holder
+
+          bh=asyncio.run(browser_recover())
+          if eas_path is None and bh["eas"]: eas_path=Path(bh["eas"])
+          eur_files=[Path(x) for x in bh["eur"]]
+
+          def inspect_xlsx(path,label):
+              try: xf=pd.ExcelFile(path)
+              except Exception as e: print("XLS_ERR",label,path,repr(e)); return
+              print("XLS_SHEETS",label,json.dumps(xf.sheet_names))
+              for sh in xf.sheet_names:
+                  try:
+                      df=pd.read_excel(path,sheet_name=sh,nrows=6)
+                      print("SHEET",label,sh,"COLS",json.dumps([str(c) for c in df.columns[:100]]))
+                      print("HEAD",label,sh,df.head(3).to_json(orient="records",default_handler=str)[:5000])
+                  except Exception as e: print("SHEET_ERR",label,sh,repr(e))
+
+          if eas_path and eas_path.exists(): inspect_xlsx(eas_path,"EAS")
+          for pth in eur_files:
+              if pth.suffix==".xlsx": inspect_xlsx(pth,"EUR")
+              elif pth.suffix==".zip":
+                  import zipfile
+                  try:
+                      z=zipfile.ZipFile(pth)
+                      print("EUR_ZIP_NAMES",json.dumps(z.namelist()[:100]))
+                      for n in z.namelist():
+                          if n.lower().endswith((".xlsx",".xls")):
+                              data=z.read(n); q=OUT/("unzipped_"+Path(n).name); q.write_bytes(data); inspect_xlsx(q,"EUR_ZIP")
+                  except Exception as e: print("EUR_ZIP_ERR",repr(e))
+
+          print("FINAL_FILES")
+          for pth in OUT.iterdir():
+              if pth.is_file():
+                  print(pth.name,pth.stat().st_size,hashlib.sha256(pth.read_bytes()).hexdigest())
+          PY
+          python /tmp/o02_probe_v2.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o02-proteogenomics-probe-v2
+          path: o02_probe_v2/
+          retention-days: 3
