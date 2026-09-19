@@ -42,7 +42,7 @@ jobs:
             "AD":{
               "contrast":"ad_vs_healthy",
               "dataset_id":"c2876b1b-06d8-4d96-a56b-5304f815b99a",
-              "target_disease":"Alzheimer disease",
+              "target_disease":"dementia",
               "label":"SEA-AD_MTG_whole_taxonomy"
             },
             "PD":{
@@ -87,8 +87,7 @@ jobs:
               print("BRAIN_CELLTYPE_TOP",cfg["label"],json.dumps(obs.cell_type.astype(str).value_counts().head(80).to_dict()))
               print("BRAIN_DONORS",cfg["label"],obs.donor_id.nunique())
 
-              obs=obs[obs.is_primary_data.astype(bool)].copy() if "is_primary_data" in obs else obs.copy()
-              # Restrict to neuronal cells using standardized cell-type labels.
+              # Do not filter by is_primary_data here: in the PD reference dataset that flag\n              # removes the normal comparison cells even though they belong to this dataset.\n              # We compare all cells within the explicitly selected dataset_id.\n              # Restrict to neuronal cells using standardized cell-type labels.
               neuronal=obs.cell_type.astype(str).str.contains(
                   r"neuron|neuronal|dopaminergic|glutamatergic|GABAergic",case=False,regex=True,na=False)
               if neuronal.sum()>=500:
