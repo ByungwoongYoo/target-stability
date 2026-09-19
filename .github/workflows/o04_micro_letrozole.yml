@@ -1,0 +1,113 @@
+name: O04 micro letrozole clinical LINCS
+
+on:
+  push:
+    branches:
+      - o04-micro-letrozole-20260919
+
+jobs:
+  micro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy scipy
+      - name: Run
+        shell: bash
+        run: |
+          python - <<'PY'
+          import requests,pandas as pd,numpy as np,re,io,json,time,gzip
+          from scipy.stats import spearmanr,mannwhitneyu
+
+          CDS="http://cdsdb.ncpsb.org.cn"
+          SIG="https://maayanlab.cloud/sigcom-lincs/metadata-api/signatures/find"
+          S=requests.Session(); S.headers.update({"User-Agent":"o04-micro/0.1"})
+          def req(method,url,**kw):
+              for a in range(4):
+                  try:
+                      r=S.request(method,url,timeout=180,**kw)
+                      if r.status_code<500: r.raise_for_status(); return r
+                  except Exception as e:
+                      err=e
+                  time.sleep(1+a)
+              raise err
+
+          # Locked largest GSE20181 same-drug response/nonresponse cohort:
+          RDS="CDS_dataset_Microarray_44"; NDS="CDS_dataset_Microarray_43"
+          meta=req("POST",CDS+"/cdsdb/browse/dataset",headers={"Content-Type":"application/json","Accept":"application/json"},
+                   json={"skip":0,"limit":500,"page":1,"filter":{},"sort":{}}).json()["data"]
+          by={str(x.get("CDS-DB dataset ID")):x for x in meta}
+          def ids(ds):
+              return re.findall(r'CDS_patient_signature_\d+',str(by[ds].get("CDS patient signature list") or ""))
+          RIDS,NIDS=ids(RDS),ids(NDS)
+          print("IDS",len(RIDS),len(NIDS))
+
+          # biologically matched cell context fixed a priori: MCF7 breast cancer line.
+          arr=req("POST",SIG,json={"filter":{"where":{"meta.pert_name":"letrozole","meta.cell_line":"MCF7"},"limit":100}}).json()
+          prof=[]
+          for x in arr:
+              m=x.get("meta",{}); u=m.get("persistent_id")
+              if str(m.get("pert_type","")).lower()!="chemical" or not u: continue
+              data=req("GET",u).content
+              if data[:2]==b"\x1f\x8b" or u.endswith(".gz"): data=gzip.decompress(data)
+              d=pd.read_csv(io.BytesIO(data),sep="\t")
+              if "symbol" not in d or "CD-coefficient" not in d: continue
+              d["gene"]=d.symbol.astype(str).str.upper().str.strip()
+              d["lincs"]=pd.to_numeric(d["CD-coefficient"],errors="coerce")
+              d=d.dropna(subset=["lincs"]).drop_duplicates("gene")[["gene","lincs"]]
+              prof.append(d)
+          print("MCF7_PROFILES",len(prof))
+          if not prof: raise RuntimeError("No MCF7 letrozole profiles")
+
+          def score(pid):
+              o=req("POST",CDS+"/cdsdb/analysisResults",headers={"Content-Type":"application/json","Accept":"application/json"},
+                    json={"jobId":pid,"level":"raw/patient","logFC":1e-9,"pValue":1.0}).json()
+              tab=((o.get("results") or {}).get("deg") or {}).get("tableData") or []
+              d=pd.DataFrame(tab)
+              d["gene"]=d["Gene symbol"].astype(str).str.upper().str.strip()
+              d["patient"]=pd.to_numeric(d["LogFC"],errors="coerce")
+              d=d.dropna(subset=["patient"]).copy()
+              d["abs"]=d.patient.abs()
+              d=d.sort_values("abs",ascending=False).drop_duplicates("gene")[["gene","patient"]]
+              rs=[]; ag=[]
+              for p in prof:
+                  z=d.merge(p,on="gene")
+                  if len(z)<500: continue
+                  rho=float(spearmanr(z.patient,z.lincs).statistic)
+                  if np.isfinite(rho):
+                      rs.append(rho)
+                      ag.append(float(np.mean(np.sign(z.patient)==np.sign(z.lincs))))
+              if not rs:return None
+              return {"rho":float(np.median(rs)),"agreement":float(np.median(ag)),"n_profiles":len(rs),"n_genes":len(d)}
+
+          R=[]; N=[]
+          for label,ix,out in [("R",RIDS,R),("N",NIDS,N)]:
+              for pid in ix:
+                  s=score(pid)
+                  if s:
+                      out.append(s)
+                      print("PAT",label,pid,json.dumps(s))
+          rv=np.array([x["rho"] for x in R]); nv=np.array([x["rho"] for x in N])
+          av=np.array([x["agreement"] for x in R]); bv=np.array([x["agreement"] for x in N])
+          mw=mannwhitneyu(rv,nv,alternative="two-sided")
+          mwa=mannwhitneyu(av,bv,alternative="two-sided")
+          # Probability of superiority R>N; ties half.
+          ps=float((sum((r>n)+0.5*(r==n) for r in rv for n in nv))/(len(rv)*len(nv)))
+          out={
+            "cohort":"GSE20181 letrozole 10-14d",
+            "n_R":len(rv),"n_N":len(nv),"lincs_context":"MCF7",
+            "n_lincs_profiles":len(prof),
+            "median_rho_R":float(np.median(rv)),"median_rho_N":float(np.median(nv)),
+            "delta_median_rho":float(np.median(rv)-np.median(nv)),
+            "mw_rho_p":float(mw.pvalue),"probability_R_greater_N":ps,
+            "median_direction_agreement_R":float(np.median(av)),
+            "median_direction_agreement_N":float(np.median(bv)),
+            "delta_direction_agreement":float(np.median(av)-np.median(bv)),
+            "mw_direction_p":float(mwa.pvalue)
+          }
+          print("=== O04_MICRO_LETROZOLE_RESULT ===")
+          print(json.dumps(out,indent=2))
+          PY
