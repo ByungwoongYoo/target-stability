@@ -18,3 +18,4 @@ jobs:
           python-version: '3.11'
       - run: pip install anndata==0.10.6 pandas requests h5py
       - run: python iris_diag/inspect_ids.py
+# retrigger diagnostic
