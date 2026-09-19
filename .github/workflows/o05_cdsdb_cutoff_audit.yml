@@ -1,0 +1,42 @@
+name: O05 CDSDB cutoff audit
+
+on:
+  push:
+    branches:
+      - o05-cdsdb-lincs-clinical-concordance-20260919
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas
+      - name: Audit CDS-DB analysis cutoff behavior
+        run: |
+          python - <<'PY'
+          import requests,pandas as pd
+          S=requests.Session(); S.headers.update({"User-Agent":"o05-cutoff-audit/0.1"})
+          url="http://cdsdb.ncpsb.org.cn/cdsdb/analysisResults"
+          ids=["CDS_dataset_Microarray_116","CDS_dataset_Microarray_117","CDS_dataset_Microarray_44","CDS_dataset_Microarray_43"]
+          vals=[0.6,0.5,0.4,0.3,0.2,0.1,0.05,0.01,0.001,1e-9]
+          for did in ids:
+              print("DATASET",did)
+              for lf in vals:
+                  r=S.post(url,json={"jobId":did,"level":"raw/dataset","logFC":lf,"pValue":1.0},timeout=90)
+                  print("HTTP",lf,r.status_code,len(r.content))
+                  try:
+                      obj=r.json()
+                      tab=((obj.get("results") or {}).get("deg") or {}).get("tableData") or []
+                      d=pd.DataFrame(tab)
+                      if d.empty:
+                          print("CUT",lf,"N",0)
+                      else:
+                          x=pd.to_numeric(d.get("LogFC"),errors="coerce").dropna()
+                          print("CUT",lf,"N",len(d),"MINABS",float(x.abs().min()) if len(x) else None,"MAXABS",float(x.abs().max()) if len(x) else None)
+                  except Exception as e:
+                      print("ERR",lf,repr(e),r.text[:500])
+          PY
