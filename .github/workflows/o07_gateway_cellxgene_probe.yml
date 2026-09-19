@@ -1,0 +1,82 @@
+name: O07 Gateway CELLxGENE probe
+
+on:
+  push:
+    branches:
+      - o07-gateway-brain-concordance-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install cellxgene-census pandas pyarrow
+      - name: Probe CELLxGENE Census datasets
+        shell: bash
+        run: |
+          mkdir -p o07_probe
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          import pandas as pd
+          import cellxgene_census
+
+          out=Path("o07_probe")
+          with cellxgene_census.open_soma(census_version="latest") as census:
+              d=census["census_info"]["datasets"].read().concat().to_pandas()
+              print("DATASET_COLS",d.columns.tolist())
+              print("N_DATASETS",len(d))
+              # broad title/collection search
+              fields=[c for c in ["dataset_title","collection_name","dataset_h5ad_path","dataset_id","collection_id"] if c in d.columns]
+              def match(pattern):
+                  mask=pd.Series(False,index=d.index)
+                  for c in ["dataset_title","collection_name"]:
+                      if c in d.columns:
+                          mask |= d[c].astype(str).str.contains(pattern,case=False,regex=True,na=False)
+                  return d.loc[mask,fields].drop_duplicates()
+              gateway=match(r"gateway|olfactory|crownlands")
+              ad=match(r"alzheimer|dementia|rosmap|brain")
+              pdx=match(r"parkinson|lewy")
+              print("GATEWAY_MATCHES",gateway.to_json(orient="records"))
+              print("AD_BRAIN_MATCHES",ad.head(300).to_json(orient="records"))
+              print("PD_MATCHES",pdx.head(300).to_json(orient="records"))
+              gateway.to_csv(out/"gateway_matches.csv",index=False)
+              ad.to_csv(out/"ad_brain_matches.csv",index=False)
+              pdx.to_csv(out/"pd_matches.csv",index=False)
+
+              # inspect obs metadata value counts for Gateway datasets only
+              results=[]
+              for rec in gateway.to_dict("records"):
+                  dsid=rec.get("dataset_id")
+                  if not dsid: continue
+                  print("INSPECT_GATEWAY",dsid,rec)
+                  try:
+                      obs=census["census_data"]["homo_sapiens"].obs.read(
+                        value_filter=f'dataset_id == "{dsid}"',
+                        column_names=["dataset_id","disease","disease_ontology_term_id","cell_type","cell_type_ontology_term_id",
+                                      "tissue","tissue_ontology_term_id","assay","assay_ontology_term_id",
+                                      "sex","self_reported_ethnicity","donor_id"]
+                      ).concat().to_pandas()
+                      print("OBS_ROWS",len(obs))
+                      for col in ["disease","cell_type","tissue","assay","sex","self_reported_ethnicity"]:
+                          if col in obs:
+                              vc=obs[col].astype(str).value_counts().head(100).to_dict()
+                              print("VC",col,json.dumps(vc,ensure_ascii=False))
+                      print("DONORS",obs["donor_id"].nunique() if "donor_id" in obs else None)
+                      results.append({"dataset":rec,"n_obs":len(obs),"n_donors":int(obs["donor_id"].nunique()) if "donor_id" in obs else None,
+                                      "disease_counts":obs["disease"].astype(str).value_counts().to_dict() if "disease" in obs else {}})
+                  except Exception as e:
+                      print("GATEWAY_OBS_ERR",dsid,repr(e))
+              (out/"gateway_obs_summary.json").write_text(json.dumps(results,indent=2,ensure_ascii=False))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o07-gateway-cellxgene-probe
+          path: o07_probe/
+          retention-days: 5
