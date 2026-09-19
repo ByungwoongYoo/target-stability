@@ -5,6 +5,7 @@ on:
     branches:
       - iris-validation-20260919
     paths:
+      - 'iris_stage2/**'
       - '.github/workflows/iris_stage2_light.yml'
 
 permissions:
