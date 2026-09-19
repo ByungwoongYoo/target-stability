@@ -1,0 +1,69 @@
+name: O07 Gateway derived disease-DE audit
+
+on:
+  push:
+    branches:
+      - o07-gateway-brain-concordance-20260919
+
+jobs:
+  derived_de:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas
+      - name: Fetch public derived Gateway disease DE
+        shell: bash
+        run: |
+          mkdir -p o07_derived
+          python - <<'PY'
+          import requests,json,io,re
+          import pandas as pd
+          from pathlib import Path
+          OUT=Path("o07_derived")
+          repo="yashvir/olfactory-regenerative-age-data"
+          H={"User-Agent":"o07-gateway-validation/0.1"}
+          u=f"https://huggingface.co/api/datasets/{repo}/tree/main/results/tables"
+          r=requests.get(u,params={"recursive":"false","expand":"false","limit":1000},headers=H,timeout=120)
+          print("TREE",r.status_code,len(r.content),r.url)
+          r.raise_for_status()
+          arr=r.json()
+          names=[x.get("path") for x in arr if x.get("type")=="file"]
+          hits=[x for x in names if re.search(r'pseudobulk_genomewide.*(matched|summary|audit|top_hits|limma|edger)',x,re.I)]
+          print("HITS",json.dumps(hits,indent=2))
+          (OUT/"tree_hits.json").write_text(json.dumps(hits,indent=2))
+          wanted=[
+            "results/tables/pseudobulk_genomewide_de_summary_matched_flex_v2_device.tsv",
+            "results/tables/pseudobulk_genomewide_de_audit_matched_flex_v2_device.tsv",
+            "results/tables/pseudobulk_genomewide_limma_voom_de_summary_matched_flex_v2_device.tsv",
+            "results/tables/pseudobulk_genomewide_limma_voom_de_audit_matched_flex_v2_device.tsv",
+            "results/tables/pseudobulk_genomewide_edger_matched_flex_v2_device.tsv.gz",
+            "results/tables/pseudobulk_genomewide_limma_voom_matched_flex_v2_device.tsv.gz",
+          ]
+          for path in wanted:
+              raw=f"https://huggingface.co/datasets/{repo}/resolve/main/{path}"
+              rr=requests.get(raw,headers=H,timeout=180)
+              print("FILE",path,rr.status_code,len(rr.content),rr.headers.get("content-type"))
+              if rr.status_code!=200: continue
+              dest=OUT/path.split("/")[-1]
+              dest.write_bytes(rr.content)
+              try:
+                  df=pd.read_csv(io.BytesIO(rr.content),sep="\t",compression="gzip" if path.endswith(".gz") else None)
+                  print("DF",path,"SHAPE",df.shape)
+                  print("COLS",json.dumps(df.columns.tolist()))
+                  print("HEAD",df.head(20).to_json(orient="records")[:20000])
+                  for col in df.columns:
+                      if any(k in col.lower() for k in ["contrast","disease","fdr","adj","logfc","pvalue","p_value","significant","cell_type"]):
+                          if df[col].nunique(dropna=False)<100:
+                              print("VC",path,col,json.dumps(df[col].value_counts(dropna=False).head(100).to_dict(),default=str)[:12000])
+              except Exception as e: print("PARSE_ERR",path,repr(e))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o07-gateway-derived-de
+          path: o07_derived/
+          retention-days: 5
