@@ -1,0 +1,77 @@
+name: O04 CDSDB overlap probe
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  overlap_probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install pandas openpyxl requests playwright
+          python -m playwright install --with-deps chromium
+      - name: Probe CDSDB drug/regimen inventory and download request
+        shell: bash
+        run: |
+          python - <<'PY'
+          import io,re,json,asyncio,requests,pandas as pd
+          from collections import Counter
+          from playwright.async_api import async_playwright
+
+          ua="Mozilla/5.0"
+          url="http://cdsdb.cloudna.cn/apiFlaskResult/help/CDS-DB%20dataset%20information.xlsx"
+          r=requests.get(url,headers={"User-Agent":ua},timeout=180,allow_redirects=True)
+          print("INFO_XLSX",r.status_code,len(r.content),r.headers.get("content-type"),r.url)
+          r.raise_for_status()
+          xf=pd.ExcelFile(io.BytesIO(r.content))
+          print("SHEETS",xf.sheet_names)
+          for sh in xf.sheet_names:
+              df=pd.read_excel(io.BytesIO(r.content),sheet_name=sh)
+              print("SHEET",sh,"SHAPE",df.shape)
+              print("COLS",json.dumps([str(c) for c in df.columns],ensure_ascii=False))
+              print("HEAD",df.head(5).to_json(orient="records",force_ascii=False)[:8000])
+              for c in df.columns:
+                  s=str(c).lower()
+                  if any(k in s for k in ["drug","therapeut","regimen"]):
+                      vals=df[c].dropna().astype(str).str.strip()
+                      print("FIELD",c,"N_UNIQUE",vals.nunique())
+                      print("VALUES",json.dumps(vals.value_counts().head(300).to_dict(),ensure_ascii=False)[:20000])
+
+          async def browser():
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context(user_agent="Mozilla/5.0",accept_downloads=True)
+                  pg=await ctx.new_page()
+                  seen=[]
+                  pg.on("request",lambda req: seen.append({"method":req.method,"url":req.url}) if re.search(r'download|apiFlask|dataset|patient|signature|export|tar|zip',req.url,re.I) else None)
+                  await pg.goto("http://cdsdb.cloudna.cn/browse",wait_until="domcontentloaded",timeout=120000)
+                  await pg.wait_for_timeout(5000)
+                  print("BROWSE_TITLE",await pg.title())
+                  print("BROWSE_BODY",(await pg.locator("body").inner_text())[:30000])
+                  buttons=await pg.locator("button").evaluate_all("""els=>els.map(e=>({text:(e.innerText||'').trim(),id:e.id||'',cls:e.className||''}))""")
+                  print("BUTTONS",json.dumps(buttons,ensure_ascii=False)[:30000])
+                  links=await pg.locator("a").evaluate_all("""els=>els.map(e=>({text:(e.innerText||'').trim(),href:e.href||''}))""")
+                  print("DL_LINKS",json.dumps([x for x in links if re.search(r'download|apiFlask|tar|zip',json.dumps(x),re.I)],ensure_ascii=False)[:30000])
+                  # Try visible Download All buttons but abort/record request if possible.
+                  loc=pg.get_by_text("Download All",exact=True)
+                  print("DOWNLOAD_ALL_COUNT",await loc.count())
+                  for i in range(min(await loc.count(),3)):
+                      try:
+                          async with pg.expect_download(timeout=15000) as di:
+                              await loc.nth(i).click()
+                          d=await di.value
+                          print("DOWNLOAD",i,d.suggested_filename,d.url)
+                          await d.cancel()
+                      except Exception as e:
+                          print("DOWNLOAD_CLICK_ERR",i,repr(e))
+                  print("SEEN",json.dumps(seen[-300:],ensure_ascii=False)[:30000])
+                  await b.close()
+          asyncio.run(browser())
+          PY
