@@ -5,7 +5,6 @@ import requests
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score, average_precision_score
-import mygene
 
 ROOT=Path("iris_external_bmp")
 OUT=ROOT/"results"
