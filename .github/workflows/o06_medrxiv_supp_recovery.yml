@@ -1,0 +1,99 @@
+name: O06 medRxiv supplement recovery
+
+on:
+  push:
+    branches:
+      - o06-natural-knockout-cancer-dependency-20260919
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install playwright requests pandas openpyxl
+          python -m playwright install --with-deps chromium
+      - name: Recover supplementary links
+        shell: bash
+        run: |
+          mkdir -p o06_supp
+          cat > /tmp/recover.py <<'PY'
+          import asyncio,re,json,requests,zipfile,io
+          from pathlib import Path
+          import pandas as pd
+          from playwright.async_api import async_playwright
+          OUT=Path("o06_supp"); OUT.mkdir(exist_ok=True)
+          URL="https://www.medrxiv.org/content/10.64898/2026.05.13.26352722v1"
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"
+          async def main():
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context(user_agent=UA,accept_downloads=True)
+                  pg=await ctx.new_page()
+                  await pg.goto(URL,wait_until="domcontentloaded",timeout=120000)
+                  await pg.wait_for_timeout(5000)
+                  print("TITLE",await pg.title(),"URL",pg.url)
+                  links=await pg.locator("a").evaluate_all("""els=>els.map(e=>({text:(e.innerText||'').trim(),href:e.href||'',download:e.download||''}))""")
+                  cand=[x for x in links if re.search(r'supp|additional|DC\d|media-|\.xlsx|\.xls|\.zip|\.csv|\.tsv',json.dumps(x),re.I)]
+                  print("CAND",json.dumps(cand,indent=2)[:30000])
+                  (OUT/"links.json").write_text(json.dumps(links,indent=2),encoding="utf-8")
+                  seen=set()
+                  saved=[]
+                  for i,x in enumerate(cand):
+                      u=x.get("href")
+                      if not u or u in seen: continue
+                      seen.add(u)
+                      try:
+                          r=await ctx.request.get(u,timeout=180000)
+                          body=await r.body(); ct=r.headers.get("content-type","")
+                          print("GET",i,r.status,ct,len(body),u)
+                          if r.status==200 and len(body)>1000:
+                              ext=".bin"
+                              if body[:2]==b"PK": ext=".zip"
+                              elif body[:4]==b"%PDF": ext=".pdf"
+                              elif "spreadsheet" in ct: ext=".xlsx"
+                              elif "csv" in ct: ext=".csv"
+                              name=f"supp_{i}{ext}"
+                              (OUT/name).write_bytes(body); saved.append(OUT/name)
+                      except Exception as e: print("ERR",u,repr(e))
+                  await b.close()
+              for p in saved:
+                  data=p.read_bytes()
+                  if data[:2]==b"PK":
+                      # first try xlsx directly
+                      try:
+                          xf=pd.ExcelFile(io.BytesIO(data))
+                          print("XLS_DIRECT",p.name,xf.sheet_names)
+                          for sh in xf.sheet_names:
+                              df=pd.read_excel(io.BytesIO(data),sheet_name=sh,nrows=8)
+                              print("XLS_SHEET",p.name,sh,json.dumps([str(c) for c in df.columns]),df.head(3).to_json(orient="records")[:8000])
+                      except Exception as e: print("NOT_XLS",p.name,repr(e))
+                      try:
+                          z=zipfile.ZipFile(io.BytesIO(data))
+                          print("ZIP",p.name,z.namelist()[:200])
+                          for n in z.namelist():
+                              if re.search(r'\.(xlsx|xls|csv|tsv)$',n,re.I):
+                                  d=z.read(n)
+                                  print("MEMBER",n,len(d))
+                                  if n.lower().endswith(("xlsx","xls")):
+                                      try:
+                                          xf=pd.ExcelFile(io.BytesIO(d))
+                                          print("MEM_XLS",n,xf.sheet_names)
+                                          for sh in xf.sheet_names:
+                                              df=pd.read_excel(io.BytesIO(d),sheet_name=sh,nrows=8)
+                                              print("MEM_SHEET",n,sh,json.dumps([str(c) for c in df.columns]),df.head(3).to_json(orient="records")[:8000])
+                                      except Exception as e: print("MEM_XLS_ERR",n,repr(e))
+                      except Exception as e: print("ZIP_ERR",p.name,repr(e))
+          asyncio.run(main())
+          PY
+          python /tmp/recover.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o06-medrxiv-supp
+          path: o06_supp/
+          retention-days: 5
