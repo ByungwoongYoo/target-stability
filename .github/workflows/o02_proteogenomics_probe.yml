@@ -1,0 +1,116 @@
+name: O02 proteogenomics data probe
+
+on:
+  push:
+    branches:
+      - o02-cross-ancestry-proteogenomics-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install requests pandas openpyxl playwright beautifulsoup4 lxml
+          python -m playwright install --with-deps chromium
+      - name: Probe public EAS and EUR supplementary data
+        shell: bash
+        run: |
+          mkdir -p o02_probe
+          cat > /tmp/o02_probe.py <<'PY'
+          import io, json, re, os, asyncio, hashlib
+          from pathlib import Path
+          import requests, pandas as pd
+          from playwright.async_api import async_playwright
+
+          OUT=Path("o02_probe"); OUT.mkdir(exist_ok=True)
+          H={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"}
+
+          def dl(url,path):
+              r=requests.get(url,headers=H,timeout=180,allow_redirects=True)
+              print("DL",url,"STATUS",r.status_code,"CTYPE",r.headers.get("content-type"),"BYTES",len(r.content),"FINAL",r.url)
+              r.raise_for_status()
+              Path(path).write_bytes(r.content)
+              return r.content
+
+          # East Asian CKB Zenodo supplementary workbook.
+          eas_url="https://zenodo.org/records/21503247/files/Supplementary%20Tables.xlsx?download=1"
+          eas=dl(eas_url,OUT/"EAS_Supplementary_Tables.xlsx")
+
+          async def get_eur():
+              url="https://www.medrxiv.org/content/10.64898/2026.07.23.26358667v1"
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context(accept_downloads=True,user_agent=H["User-Agent"])
+                  pg=await ctx.new_page()
+                  await pg.goto(url,wait_until="domcontentloaded",timeout=120000)
+                  await pg.wait_for_timeout(3000)
+                  print("EUR_PAGE_TITLE",await pg.title())
+                  links=await pg.locator("a").evaluate_all("""els=>els.map(e=>({text:(e.innerText||'').trim(),href:e.href||'',download:e.download||''}))""")
+                  cand=[x for x in links if re.search(r'supp|additional|\.xlsx|\.xls|DC\d|supplementary',json.dumps(x),re.I)]
+                  print("EUR_SUPP_LINKS",json.dumps(cand[:100],indent=2))
+                  (OUT/"eur_links.json").write_text(json.dumps(links,indent=2),encoding="utf-8")
+                  got=[]
+                  # prefer direct xlsx/xls/zip or supplementary material links
+                  for i,x in enumerate(cand[:30]):
+                      u=x.get("href")
+                      if not u: continue
+                      try:
+                          rr=await ctx.request.get(u,timeout=120000)
+                          body=await rr.body()
+                          ct=rr.headers.get("content-type","")
+                          print("EUR_CAND",i,u,"STATUS",rr.status,"CTYPE",ct,"BYTES",len(body))
+                          if rr.status==200 and len(body)>10000 and (body[:2]==b"PK" or "spreadsheet" in ct or "zip" in ct):
+                              name=re.sub(r'[^A-Za-z0-9_.-]+','_',u.split("/")[-1].split("?")[0]) or f"eur_{i}"
+                              path=OUT/name
+                              path.write_bytes(body)
+                              got.append(str(path))
+                      except Exception as e:
+                          print("EUR_CAND_ERR",u,repr(e))
+                  # also inspect page HTML for supplementary URLs not represented as anchors
+                  html=await pg.content()
+                  (OUT/"eur_page.html").write_text(html,encoding="utf-8")
+                  for m in re.findall(r'https?[^"\'<> ]+',html):
+                      if re.search(r'supp|DC\d|\.xlsx|\.zip',m,re.I):
+                          print("EUR_HTML_URL",m[:500])
+                  await b.close()
+                  return got
+
+          eur_files=asyncio.run(get_eur())
+          print("EUR_FILES",json.dumps(eur_files))
+
+          def inspect_xlsx(path,label):
+              try:
+                  xf=pd.ExcelFile(path)
+              except Exception as e:
+                  print("XLS_ERR",label,path,repr(e)); return
+              print("XLS_SHEETS",label,xf.sheet_names)
+              for sh in xf.sheet_names:
+                  try:
+                      df=pd.read_excel(path,sheet_name=sh,nrows=8)
+                      cols=[str(c) for c in df.columns]
+                      print("SHEET",label,sh,"HEAD_SHAPE",df.shape,"COLS",json.dumps(cols[:80]))
+                      print("HEAD",label,sh,df.head(3).to_json(orient="records",default_handler=str)[:6000])
+                  except Exception as e:
+                      print("SHEET_ERR",label,sh,repr(e))
+
+          inspect_xlsx(OUT/"EAS_Supplementary_Tables.xlsx","EAS")
+          for f in eur_files:
+              inspect_xlsx(f,"EUR")
+
+          print("FILES")
+          for p in OUT.iterdir():
+              if p.is_file():
+                  print(p.name,p.stat().st_size,hashlib.sha256(p.read_bytes()).hexdigest())
+          PY
+          python /tmp/o02_probe.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o02-proteogenomics-probe
+          path: o02_probe/
+          retention-days: 3
