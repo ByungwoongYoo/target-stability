@@ -1,0 +1,46 @@
+name: O04 proteome therapeutic-window probe
+
+on:
+  push:
+    branches:
+      - o04-proteomic-therapeutic-window-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install pandas openpyxl requests
+      - name: Inspect Nature 2026 proteome supplements
+        shell: bash
+        run: |
+          cat > /tmp/o04_probe.py <<'PY'
+          import io, json, requests, pandas as pd
+          base="https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41586-026-10660-y/MediaObjects/"
+          files={
+            "ST5":"41586_2026_10660_MOESM7_ESM.xlsx",
+            "ST6":"41586_2026_10660_MOESM8_ESM.xlsx",
+            "ST8":"41586_2026_10660_MOESM10_ESM.xlsx",
+            "ST9":"41586_2026_10660_MOESM11_ESM.xlsx",
+          }
+          H={"User-Agent":"Mozilla/5.0"}
+          for lab,fn in files.items():
+              r=requests.get(base+fn,headers=H,timeout=240)
+              print("DOWNLOAD",lab,r.status_code,len(r.content),r.headers.get("content-type"))
+              r.raise_for_status()
+              xf=pd.ExcelFile(io.BytesIO(r.content))
+              print("SHEETS",lab,json.dumps(xf.sheet_names))
+              for sh in xf.sheet_names:
+                  try:
+                      raw=pd.read_excel(io.BytesIO(r.content),sheet_name=sh,header=None,nrows=12)
+                      print("RAW",lab,sh,raw.to_json(orient="split",default_handler=str)[:12000])
+                      df=pd.read_excel(io.BytesIO(r.content),sheet_name=sh,nrows=5)
+                      print("HDR",lab,sh,json.dumps([str(x) for x in df.columns[:120]]))
+                  except Exception as e:
+                      print("ERR",lab,sh,repr(e))
+          PY
+          python /tmp/o04_probe.py
