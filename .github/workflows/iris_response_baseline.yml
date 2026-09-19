@@ -1,0 +1,26 @@
+name: IRIS response baseline audit
+on:
+  push:
+    branches: [iris-validation-20260919]
+    paths:
+      - 'iris_response_baseline/**'
+      - '.github/workflows/iris_response_baseline.yml'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install anndata==0.10.6 scikit-learn==1.4.2 pandas numpy scipy requests h5py
+      - run: python iris_response_baseline/run.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: iris-response-baseline-audit
+          path: iris_response_baseline/results/
+          if-no-files-found: warn
