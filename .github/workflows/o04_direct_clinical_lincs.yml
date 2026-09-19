@@ -1,0 +1,205 @@
+name: O04 direct clinical-LINCS concordance pilot
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  direct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy scipy
+      - name: Run direct concordance
+        shell: bash
+        run: |
+          mkdir -p o04_direct
+          cat > /tmp/o04_direct.py <<'PY'
+          import requests,pandas as pd,numpy as np,re,json,time,io,gzip
+          from pathlib import Path
+          from scipy.stats import spearmanr,wilcoxon,binomtest
+
+          OUT=Path("o04_direct"); OUT.mkdir(exist_ok=True)
+          CDS="http://cdsdb.ncpsb.org.cn"
+          SIG="https://maayanlab.cloud/sigcom-lincs/metadata-api/signatures/find"
+          H={"User-Agent":"o04-direct/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          S=requests.Session(); S.headers.update(H)
+
+          def norm(x): return re.sub(r'[^a-z0-9]','',str(x).lower())
+          def req(method,url,**kw):
+              err=None
+              for a in range(5):
+                  try:
+                      r=S.request(method,url,timeout=180,**kw)
+                      print("HTTP",method,url,r.status_code,len(r.content))
+                      if r.status_code<500:
+                          r.raise_for_status(); return r
+                      err=RuntimeError(f"{r.status_code}")
+                  except Exception as e: err=e; print("ERR",repr(e))
+                  time.sleep(2*(a+1))
+              raise err
+
+          # CDS dataset metadata
+          meta=req("POST",CDS+"/cdsdb/browse/dataset",
+                   headers={"Referer":CDS+"/browse/dataset","Content-Type":"application/json","Accept":"application/json"},
+                   json={"skip":0,"limit":500,"page":1,"filter":{},"sort":{}}).json()
+          rows=meta["data"]; byid={str(r.get("CDS-DB dataset ID")):r for r in rows}
+
+          pairs=[]; seen=set()
+          for r in rows:
+              rid=str(r.get("CDS-DB dataset ID",""))
+              rg=str(r.get("Response group","")).strip().lower()
+              opp=str(r.get("CDS-DB dataset with the opposite response group","")).strip()
+              drugs=r.get("drugNames") or []
+              if rg not in {"response","non-response"} or not opp or len(drugs)!=1 or opp not in byid: continue
+              o=byid[opp]; od=o.get("drugNames") or []
+              if len(od)!=1 or norm(drugs[0])!=norm(od[0]): continue
+              org=str(o.get("Response group","")).strip().lower()
+              if {rg,org}!={"response","non-response"}: continue
+              key=tuple(sorted([rid,opp]))
+              if key in seen: continue
+              seen.add(key)
+              rr=r if rg=="response" else o; nn=o if rg=="response" else r
+              if any(norm(rr.get(k,""))!=norm(nn.get(k,"")) for k in ["Source dataset","Therapeutic regimen","Cancer subtype"]): continue
+              pairs.append({
+                "drug":str(drugs[0]),"response_id":str(rr["CDS-DB dataset ID"]),
+                "nonresponse_id":str(nn["CDS-DB dataset ID"]),
+                "source":str(rr.get("Source dataset","")),"cancer":str(rr.get("Cancer subtype","")),
+                "response_n":rr.get("Patient size"),"nonresponse_n":nn.get("Patient size")
+              })
+          print("STRICT_PAIRS",len(pairs))
+
+          # Patient cohort continuous/top profile using relaxed API thresholds.
+          def cds_profile(did):
+              obj=req("POST",CDS+"/cdsdb/analysisResults",
+                      headers={"Referer":CDS+f"/analysisResult?level=raw/dataset&jobId={did}",
+                               "Content-Type":"application/json","Accept":"application/json"},
+                      json={"jobId":did,"level":"raw/dataset","logFC":0.0,"pValue":1.0}).json()
+              tab=((obj.get("results") or {}).get("deg") or {}).get("tableData") or []
+              d=pd.DataFrame(tab)
+              if d.empty or "Gene symbol" not in d or "LogFC" not in d: return pd.DataFrame(columns=["gene","patient"])
+              d["patient"]=pd.to_numeric(d["LogFC"],errors="coerce")
+              d["gene"]=d["Gene symbol"].astype(str).str.upper().str.strip()
+              d=d.dropna(subset=["patient"]).drop_duplicates("gene")
+              return d[["gene","patient"]]
+
+          # Exact SigCom drug records with persistent data. Prefer individual Chemical signatures.
+          cache_meta={}; cache_file={}
+          aliases={
+            "Prednisone":["prednisone"],"Carboplatin":["carboplatin"],"Letrozole":["letrozole"],
+            "Everolimus":["everolimus"],"Paclitaxel":["paclitaxel"],"Vemurafenib":["vemurafenib"],
+            "Thalidomide":["thalidomide"],"Trastuzumab":["trastuzumab"],"Prexasertib":["prexasertib"],
+            "Nivolumab":["nivolumab"],"Pembrolizumab":["pembrolizumab"]
+          }
+          def lincs_records(name):
+              if name in cache_meta:return cache_meta[name]
+              qs=aliases.get(name,[name.lower()])
+              allr=[]
+              for q in qs:
+                  payload={"filter":{"where":{"meta.pert_name":q},"limit":100}}
+                  rr=req("POST",SIG,json=payload).json()
+                  allr += rr
+              dd={x.get("id"):x for x in allr if x.get("id")}
+              rec=[]
+              for x in dd.values():
+                  m=x.get("meta",{})
+                  u=m.get("persistent_id")
+                  if not u: continue
+                  if str(m.get("pert_type","")).lower()!="chemical": continue
+                  # individual signatures only for primary; avoid mean signatures and metadata-only entries
+                  if not m.get("cell_line"): continue
+                  rec.append(x)
+              cache_meta[name]=rec
+              print("LINCS_RECORDS",name,len(rec))
+              return rec
+
+          def lincs_profile(url):
+              if url in cache_file:return cache_file[url]
+              r=req("GET",url)
+              data=r.content
+              if url.endswith(".gz") or data[:2]==b"\x1f\x8b": data=gzip.decompress(data)
+              d=pd.read_csv(io.BytesIO(data),sep="\t")
+              # canonical SigCom individual rank files: symbol, CD-coefficient
+              if "symbol" not in d.columns or "CD-coefficient" not in d.columns:
+                  print("BAD_COLS",url,list(d.columns)); return None
+              d["gene"]=d["symbol"].astype(str).str.upper().str.strip()
+              d["lincs"]=pd.to_numeric(d["CD-coefficient"],errors="coerce")
+              d=d.dropna(subset=["lincs"]).drop_duplicates("gene")[["gene","lincs"]]
+              cache_file[url]=d
+              return d
+
+          def similarity(patient, records):
+              vals=[]; agrees=[]; ns=[]
+              for x in records[:60]:  # deterministic API order, bounded download load
+                  m=x.get("meta",{}); lp=lincs_profile(m.get("persistent_id"))
+                  if lp is None: continue
+                  z=patient.merge(lp,on="gene").dropna()
+                  if len(z)<30: continue
+                  rho=spearmanr(z.patient,z.lincs).statistic
+                  if np.isfinite(rho): vals.append(float(rho))
+                  agrees.append(float(np.mean(np.sign(z.patient)==np.sign(z.lincs))))
+                  ns.append(int(len(z)))
+              if not vals:return None
+              return {
+                "n_lincs_signatures":len(vals),"shared_gene_median":float(np.median(ns)),
+                "rho_median":float(np.median(vals)),"rho_mean":float(np.mean(vals)),
+                "rho_max":float(np.max(vals)),"rho_q90":float(np.quantile(vals,.9)),
+                "direction_agreement_median":float(np.median(agrees))
+              }
+
+          tested=[]
+          for p in sorted(pairs,key=lambda x:(x["drug"].lower(),x["source"])):
+              recs=lincs_records(p["drug"])
+              if not recs: continue
+              rp=cds_profile(p["response_id"]); npf=cds_profile(p["nonresponse_id"])
+              print("CDS_PROFILE",p["drug"],p["response_id"],len(rp),p["nonresponse_id"],len(npf))
+              rs=similarity(rp,recs) if len(rp)>=30 else None
+              ns=similarity(npf,recs) if len(npf)>=30 else None
+              out=dict(p); out["response"]=rs; out["nonresponse"]=ns
+              out["complete"]=bool(rs and ns)
+              if out["complete"]:
+                  for key in ["rho_median","rho_mean","rho_max","rho_q90","direction_agreement_median"]:
+                      out["delta_"+key+"_R_minus_NR"]=rs[key]-ns[key]
+              tested.append(out)
+              print("PAIR",json.dumps(out,ensure_ascii=False)[:10000])
+
+          complete=[x for x in tested if x["complete"]]
+          def summarize(key):
+              a=np.array([x[key] for x in complete],float)
+              if len(a)==0:return {"n":0}
+              pos=int((a>0).sum()); neg=int((a<0).sum())
+              o={"n":int(len(a)),"median":float(np.median(a)),"mean":float(np.mean(a)),
+                 "positive":pos,"negative":neg,"zero":int((a==0).sum())}
+              if pos+neg:o["sign_test_p"]=float(binomtest(pos,pos+neg,.5).pvalue)
+              if len(a)>=2 and np.any(a!=0):
+                  try:o["wilcoxon_p"]=float(wilcoxon(a,zero_method="wilcox").pvalue)
+                  except Exception as e:o["wilcoxon_error"]=repr(e)
+              return o
+
+          summary={
+            "strict_pairs":len(pairs),
+            "pairs_with_any_lincs_records":int(sum(1 for x in tested if x.get("response") or x.get("nonresponse"))),
+            "complete_pairs":len(complete),
+            "PRIMARY_delta_median_rho":summarize("delta_rho_median_R_minus_NR"),
+            "SECONDARY_delta_mean_rho":summarize("delta_rho_mean_R_minus_NR"),
+            "SECONDARY_delta_max_rho":summarize("delta_rho_max_R_minus_NR"),
+            "SECONDARY_delta_q90_rho":summarize("delta_rho_q90_R_minus_NR"),
+            "SECONDARY_delta_direction_agreement":summarize("delta_direction_agreement_median_R_minus_NR")
+          }
+          print("=== O04_DIRECT_RESULT ===")
+          print(json.dumps(summary,indent=2))
+          (OUT/"summary.json").write_text(json.dumps(summary,indent=2),encoding="utf-8")
+          (OUT/"pairs.json").write_text(json.dumps(tested,indent=2,ensure_ascii=False),encoding="utf-8")
+          PY
+          python /tmp/o04_direct.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o04-direct-concordance
+          path: o04_direct/
+          retention-days: 5
