@@ -1,0 +1,184 @@
+name: O04 proteomic therapeutic-window clinical pilot
+on:
+  push:
+    branches: [o04-proteomic-therapeutic-window-20260919]
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - name: Install
+        run: pip install pandas openpyxl requests pyarrow scipy statsmodels
+      - name: Run locked first pilot
+        shell: bash
+        run: |
+          cat > /tmp/o04_pilot.py <<'PY'
+          import io, json, time, urllib.parse, xml.etree.ElementTree as ET
+          import numpy as np, pandas as pd, requests, pyarrow.parquet as pq
+          from scipy.stats import fisher_exact, mannwhitneyu
+          import statsmodels.api as sm
+
+          BASE="https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41586-026-10660-y/MediaObjects/"
+          S3="https://open-targets-public-data-releases.s3.amazonaws.com/"
+          H={"User-Agent":"o04-proteomic-window/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          NS={"s3":"http://s3.amazonaws.com/doc/2006-03-01/"}
+
+          def req(url,params=None):
+              last=None
+              for i in range(6):
+                  try:
+                      r=requests.get(url,params=params,headers=H,timeout=300)
+                      if r.status_code < 500:
+                          r.raise_for_status(); return r
+                      last=RuntimeError(f"HTTP {r.status_code}")
+                  except Exception as e: last=e
+                  time.sleep(2*(i+1))
+              raise last
+
+          def xlsx(fn,sheet):
+              r=req(BASE+fn)
+              return pd.read_excel(io.BytesIO(r.content),sheet_name=sheet)
+
+          # Nature 2026 proteome: all significant DEP and source-defined tumour-enriched set.
+          dep=xlsx("41586_2026_10660_MOESM8_ESM.xlsx","B.Diff.report.filtered.DEP")
+          enr=xlsx("41586_2026_10660_MOESM10_ESM.xlsx","C.Tumor.enriched")
+          dep["Genes"]=dep["Genes"].astype(str).str.strip()
+          enr["Genes"]=enr["Genes"].astype(str).str.strip()
+          up=dep[dep["direction"].astype(str).str.lower().eq("up")].copy()
+          for c in ["g_adj","effect"]:
+              up[c]=pd.to_numeric(up[c],errors="coerce")
+          for c in ["delta","g_adj","log2FC","log2.median.T","log2.median.max.N"]:
+              if c in enr: enr[c]=pd.to_numeric(enr[c],errors="coerce")
+
+          gene=(up.groupby("Genes",as_index=False)
+                .agg(max_g=("g_adj","max"),
+                     median_g=("g_adj","median"),
+                     n_cancers_up=("cancer_abbr","nunique")))
+          eg=(enr.groupby("Genes",as_index=False)
+              .agg(n_cancers_enriched=("cancer_abbr","nunique"),
+                   max_delta=("delta","max"),
+                   median_delta=("delta","median"),
+                   max_enriched_g=("g_adj","max")))
+          gene=gene.merge(eg,on="Genes",how="left")
+          gene["tumor_enriched"]=(gene["n_cancers_enriched"].fillna(0)>0).astype(int)
+          print("NATURE_COUNTS",json.dumps({
+              "filtered_up_rows":len(up),
+              "unique_up_genes":gene.Genes.nunique(),
+              "tumor_enriched_rows":len(enr),
+              "unique_tumor_enriched_genes":eg.Genes.nunique()
+          }))
+
+          def list_keys(prefix):
+              ks=[]; token=None
+              while True:
+                  params={"list-type":"2","prefix":prefix,"max-keys":"1000"}
+                  if token: params["continuation-token"]=token
+                  root=ET.fromstring(req(S3,params=params).content)
+                  ks += [x.find("s3:Key",NS).text for x in root.findall("s3:Contents",NS)]
+                  if root.findtext("s3:IsTruncated",default="false",namespaces=NS)!="true": break
+                  token=root.findtext("s3:NextContinuationToken",default=None,namespaces=NS)
+              return ks
+
+          def read_ot(name,wanted):
+              fs=[]
+              for k in [x for x in list_keys(f"platform/26.06/output/{name}/") if x.endswith(".parquet")]:
+                  tab=pq.read_table(io.BytesIO(req(S3+urllib.parse.quote(k,safe="/")).content))
+                  cols=[c for c in wanted if c in tab.schema.names]
+                  fs.append(tab.select(cols).to_pandas())
+              return pd.concat(fs,ignore_index=True)
+
+          targets=read_ot("target",["id","approvedSymbol"]).dropna().drop_duplicates("id")
+          diseases=read_ot("disease",["id","name","therapeuticAreas"])
+          ev=read_ot("evidence_clinical_precedence",["targetId","diseaseId","clinicalStage","drugId"])
+
+          CANCER_TA="MONDO_0045024"
+          def is_cancer(v):
+              return isinstance(v,(list,tuple,np.ndarray)) and CANCER_TA in [str(x) for x in v]
+          cancer_ids=set(diseases.loc[diseases.therapeuticAreas.map(is_cancer),"id"].astype(str))
+          print("OT_CANCER_DISEASES",len(cancer_ids))
+
+          stage={"UNKNOWN":0.0,"PRECLINICAL":0.1,"IND":0.5,"EARLY_PHASE_1":0.75,
+                 "PHASE_1":1.0,"PHASE_1_2":1.5,"PHASE_2":2.0,"PHASE_2_3":2.5,
+                 "PHASE_3":3.0,"PREAPPROVAL":3.5,"APPROVAL":4.0,"PHASE_4":4.0,
+                 "WITHDRAWAL":0.0}
+          cev=ev[ev.diseaseId.astype(str).isin(cancer_ids)].copy()
+          cev["stage"]=cev.clinicalStage.astype(str).map(stage).fillna(0.0)
+          mx=(cev.groupby("targetId",as_index=False)
+              .agg(max_oncology_stage=("stage","max"),
+                   oncology_drugs=("drugId","nunique"),
+                   oncology_indications=("diseaseId","nunique")))
+          sym=targets.merge(mx,left_on="id",right_on="targetId",how="left")
+          sym["max_oncology_stage"]=sym.max_oncology_stage.fillna(0.0)
+          sym["oncology_drugs"]=sym.oncology_drugs.fillna(0).astype(int)
+          sym["oncology_indications"]=sym.oncology_indications.fillna(0).astype(int)
+          sym=(sym.groupby("approvedSymbol",as_index=False)
+               .agg(max_oncology_stage=("max_oncology_stage","max"),
+                    oncology_drugs=("oncology_drugs","max"),
+                    oncology_indications=("oncology_indications","max")))
+
+          d=gene.merge(sym,left_on="Genes",right_on="approvedSymbol",how="left")
+          d["max_oncology_stage"]=d.max_oncology_stage.fillna(0.0)
+          d["oncology_drugs"]=d.oncology_drugs.fillna(0).astype(int)
+          d["oncology_indications"]=d.oncology_indications.fillna(0).astype(int)
+          d=d[np.isfinite(d.max_g)].copy()
+
+          # Locked endpoints. Explicit integer 0/1 throughout.
+          eps={"any_clinical":0.75,"phase2plus":2.0,"phase3plus":3.0,"approval":4.0}
+          res={"n_genes":len(d),"tumor_enriched_n":int(d.tumor_enriched.sum()),"endpoints":{}}
+          d["max_g_z"]=(d.max_g-d.max_g.mean())/(d.max_g.std(ddof=0) or 1)
+          d["breadth_log"]=np.log1p(d.n_cancers_up)
+
+          for ep,cut in eps.items():
+              d[ep]=(d.max_oncology_stage>=cut).astype(int)
+              a=d[d.tumor_enriched.eq(1)]; b=d[d.tumor_enriched.eq(0)]
+              ae=int(a[ep].sum()); be=int(b[ep].sum())
+              OR,p=fisher_exact([[ae,len(a)-ae],[be,len(b)-be]],alternative="two-sided")
+              rec={
+                  "enriched_n":len(a),"enriched_event":ae,"enriched_rate":ae/len(a) if len(a) else None,
+                  "other_n":len(b),"other_event":be,"other_rate":be/len(b) if len(b) else None,
+                  "fisher_OR":float(OR),"fisher_p":float(p)
+              }
+              # Baseline-adjusted: window adds information beyond tumour upregulation magnitude and breadth.
+              X=sm.add_constant(d[["tumor_enriched","max_g_z","breadth_log"]].astype(float),has_constant="add")
+              y=d[ep].astype(float).values
+              try:
+                  m=sm.GLM(y,X,family=sm.families.Binomial()).fit()
+                  beta=float(m.params["tumor_enriched"]); se=float(m.bse["tumor_enriched"])
+                  rec["adjusted_OR_window"]=float(np.exp(beta))
+                  rec["adjusted_CI95"]=[float(np.exp(beta-1.96*se)),float(np.exp(beta+1.96*se))]
+                  rec["adjusted_p_window"]=float(m.pvalues["tumor_enriched"])
+                  rec["p_max_g"]=float(m.pvalues["max_g_z"])
+                  rec["p_breadth"]=float(m.pvalues["breadth_log"])
+              except Exception as e:
+                  rec["glm_error"]=repr(e)
+              res["endpoints"][ep]=rec
+
+          # Within source-defined tumour-enriched genes, test whether larger quantitative window delta tracks maturity.
+          z=d[d.tumor_enriched.eq(1) & np.isfinite(d.max_delta)].copy()
+          res["continuous_window"]={"n":len(z)}
+          if len(z):
+              z["delta_z"]=(z.max_delta-z.max_delta.mean())/(z.max_delta.std(ddof=0) or 1)
+              for ep in ["phase2plus","phase3plus","approval"]:
+                  a=z.loc[z[ep].eq(1),"max_delta"]; b=z.loc[z[ep].eq(0),"max_delta"]
+                  rr={"event_n":len(a),"nonevent_n":len(b),
+                      "event_median_delta":float(a.median()) if len(a) else None,
+                      "nonevent_median_delta":float(b.median()) if len(b) else None}
+                  if len(a) and len(b):
+                      rr["mw_p"]=float(mannwhitneyu(a,b,alternative="two-sided").pvalue)
+                  X=sm.add_constant(z[["delta_z","max_g_z","breadth_log"]].astype(float),has_constant="add")
+                  y=z[ep].astype(float).values
+                  try:
+                      m=sm.GLM(y,X,family=sm.families.Binomial()).fit()
+                      bb=float(m.params["delta_z"]); se=float(m.bse["delta_z"])
+                      rr["OR_per_SD_delta"]=float(np.exp(bb))
+                      rr["CI95"]=[float(np.exp(bb-1.96*se)),float(np.exp(bb+1.96*se))]
+                      rr["p_delta"]=float(m.pvalues["delta_z"])
+                  except Exception as e: rr["glm_error"]=repr(e)
+                  res["continuous_window"][ep]=rr
+
+          print("=== O04_PROTEOMIC_WINDOW_PILOT ===")
+          print(json.dumps(res,indent=2,default=str))
+          PY
+          python /tmp/o04_pilot.py
