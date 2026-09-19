@@ -1,0 +1,94 @@
+name: O07 exact Gateway collection probe
+
+on:
+  push:
+    branches:
+      - o07-gateway-brain-concordance-20260919
+
+jobs:
+  gateway_exact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install requests playwright pandas
+          python -m playwright install --with-deps chromium
+      - name: Recover exact Gateway collection metadata
+        shell: bash
+        run: |
+          mkdir -p o07_exact
+          cat > /tmp/o07_exact.py <<'PY'
+          import requests,json,re,asyncio
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          OUT=Path("o07_exact"); OUT.mkdir(exist_ok=True)
+          CID="8b35aa1f-6bcf-4a51-abc3-a3f336a44ae6"
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"
+          H={"User-Agent":UA,"Accept":"application/json,text/plain,*/*"}
+          urls=[
+            f"https://api.cellxgene.cziscience.com/curation/v1/collections/{CID}",
+            f"https://api.cellxgene.cziscience.com/curation/v1/collections/{CID}/datasets",
+            f"https://api.cellxgene.cziscience.com/dp/v1/collections/{CID}",
+            f"https://api.cellxgene.cziscience.com/dp/v1/collections/{CID}/datasets",
+            f"https://cellxgene.cziscience.com/collections/{CID}",
+          ]
+          for i,u in enumerate(urls):
+              try:
+                  r=requests.get(u,headers=H,timeout=120,allow_redirects=True)
+                  print("GET",i,u,"STATUS",r.status_code,"CTYPE",r.headers.get("content-type"),"BYTES",len(r.content),"FINAL",r.url)
+                  print("PREFIX",r.text[:10000])
+                  (OUT/f"resp_{i}.txt").write_bytes(r.content)
+              except Exception as e: print("GET_ERR",i,u,repr(e))
+
+          async def browser():
+              from playwright.async_api import async_playwright
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context(user_agent=UA,accept_downloads=True)
+                  pg=await ctx.new_page()
+                  calls=[]
+                  async def cap(r):
+                      try:
+                          ct=r.headers.get("content-type","")
+                          if "cellxgene" in r.url or "collection" in r.url or "dataset" in r.url or "h5ad" in r.url:
+                              body=""
+                              if any(x in ct.lower() for x in ["json","text"]):
+                                  body=(await r.text())[:20000]
+                              calls.append({"status":r.status,"url":r.url,"ctype":ct,"body":body})
+                      except Exception as e:
+                          calls.append({"url":getattr(r,"url",""),"err":repr(e)})
+                  pg.on("response",cap)
+                  u=f"https://cellxgene.cziscience.com/collections/{CID}"
+                  await pg.goto(u,wait_until="networkidle",timeout=120000)
+                  await pg.wait_for_timeout(5000)
+                  print("PAGE_TITLE",await pg.title(),"FINAL",pg.url)
+                  body=(await pg.locator("body").inner_text())
+                  print("PAGE_BODY",body[:30000])
+                  html=await pg.content()
+                  (OUT/"page.html").write_text(html,encoding="utf-8")
+                  links=await pg.locator("a").evaluate_all("""els=>els.map(e=>({text:(e.innerText||'').trim(),href:e.href||'',download:e.download||''}))""")
+                  print("LINKS",json.dumps([x for x in links if re.search(r'h5ad|dataset|download|collection',json.dumps(x),re.I)][:500],indent=2)[:50000])
+                  print("CALLS",json.dumps(calls,indent=2)[:100000])
+                  (OUT/"calls.json").write_text(json.dumps(calls,indent=2),encoding="utf-8")
+                  # extract UUIDs and download-looking URLs from HTML/calls
+                  text=html+"\n"+json.dumps(calls)
+                  uu=sorted(set(re.findall(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',text,re.I)))
+                  print("UUIDS",json.dumps(uu,indent=2))
+                  urls2=sorted(set(re.findall(r'https?[^"\\\s<>]+',text)))
+                  urls2=[x.replace("\\u0026","&") for x in urls2 if re.search(r'h5ad|dataset|download|s3|cellxgene',x,re.I)]
+                  print("URLS2",json.dumps(urls2[:500],indent=2)[:60000])
+                  await b.close()
+          asyncio.run(browser())
+          PY
+          python /tmp/o07_exact.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o07-gateway-exact-probe
+          path: o07_exact/
+          retention-days: 5
