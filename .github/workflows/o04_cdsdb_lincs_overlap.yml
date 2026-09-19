@@ -1,0 +1,120 @@
+name: O04 CDSDB LINCS overlap
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  overlap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl
+      - name: Compute single-agent CDSDB to LINCS overlap
+        shell: bash
+        run: |
+          python - <<'PY'
+          import io,re,json,tarfile,requests,pandas as pd
+          from urllib.parse import quote
+
+          UA={"User-Agent":"Mozilla/5.0"}
+          xurl="http://cdsdb.cloudna.cn/apiFlaskResult/help/CDS-DB%20dataset%20information.xlsx"
+          b=requests.get(xurl,headers=UA,timeout=180).content
+          df=pd.read_excel(io.BytesIO(b),sheet_name="Sheet1")
+          reg=df["Therapeutic regimen"].dropna().astype(str).str.strip()
+          single=sorted({x for x in reg if " + " not in x and "/" not in x and x not in {"Platinum","Anthracycline","AndoSan","IFN-alpha2","Dendritic Cell Vaccine + Human interleukin-2 + IFN-alpha2"}})
+          print("CDS_REGIMENS",reg.nunique())
+          print("CDS_SINGLE_AGENT_CANDIDATES",len(single))
+          print("CDS_SINGLE_LIST",json.dumps(single,ensure_ascii=False))
+
+          api="https://maayanlab.cloud/sigcom-lincs/metadata-api/signatures/find"
+          rows=[]
+          def variants(name):
+              out={name}
+              aliases={
+                "Fluorouracil":["5-fluorouracil","fluorouracil"],
+                "Trastuzumab":["trastuzumab"],
+                "Vemurafenib":["vemurafenib"],
+                "Dabrafenib":["dabrafenib"],
+                "Pembrolizumab":["pembrolizumab"],
+                "Nivolumab":["nivolumab"],
+                "Atezolizumab":["atezolizumab"],
+                "Atorvastatin":["atorvastatin"],
+                "Carboplatin":["carboplatin"],
+                "Paclitaxel":["paclitaxel"],
+                "Docetaxel":["docetaxel"],
+                "Decitabine":["decitabine"],
+                "Everolimus":["everolimus"],
+                "Imatinib":["imatinib"],
+                "Celecoxib":["celecoxib"],
+                "Cetuximab":["cetuximab"],
+                "Tamoxifen":["tamoxifen"],
+                "Fulvestrant":["fulvestrant"],
+                "Letrozole":["letrozole"],
+                "Prednisone":["prednisone"],
+                "Prednisolone":["prednisolone"],
+                "Thalidomide":["thalidomide"],
+                "Lenalidomide":["lenalidomide"],
+                "Rituximab":["rituximab"],
+                "Ruxolitinib":["ruxolitinib"],
+                "Estradiol":["estradiol"],
+                "Prexasertib":["prexasertib"],
+                "Cediranib":["cediranib"],
+                "Figitumumab":["figitumumab"],
+                "Pidilizumab":["pidilizumab"],
+                "Ofatumumab":["ofatumumab"],
+                "Epacadostat":["epacadostat"],
+                "ADH-1":["adh-1"],
+                "Evofosfamide":["evofosfamide"],
+                "Guadecitabine":["guadecitabine"],
+                "Telapristone acetate":["telapristone acetate"],
+              }
+              for v in aliases.get(name,[]): out.add(v)
+              return sorted(out)
+
+          for name in single:
+              found=[]
+              for q in variants(name):
+                  payload={"filter":{"where":{"meta.pert_name":q},"limit":100}}
+                  try:
+                      r=requests.post(api,json=payload,headers=UA,timeout=60)
+                      if r.status_code==200:
+                          arr=r.json()
+                          if arr: found.extend(arr)
+                  except Exception as e:
+                      print("LINCS_ERR",name,q,repr(e))
+              # dedup
+              dd={x.get("id"):x for x in found if x.get("id")}
+              f=list(dd.values())
+              meta=[x.get("meta",{}) for x in f]
+              # small molecule only if pert_type says compound / small molecule or name metadata exists.
+              ptypes=sorted({str(m.get("pert_type")) for m in meta if m.get("pert_type")})
+              cells=sorted({str(m.get("cell_line")) for m in meta if m.get("cell_line")})
+              rows.append({"drug":name,"n_signatures":len(f),"pert_types":ptypes,"n_cells":len(cells),"cells":cells[:20]})
+              print("LINCS",name,len(f),json.dumps(ptypes),len(cells),json.dumps(cells[:10]))
+          m=pd.DataFrame(rows)
+          matched=m[m.n_signatures>0]
+          print("MATCHED_SINGLE_DRUGS",len(matched),"OF",len(m))
+          print("MATCHED_NAMES",json.dumps(matched.drug.tolist(),ensure_ascii=False))
+          print("UNMATCHED_NAMES",json.dumps(m.loc[m.n_signatures.eq(0),"drug"].tolist(),ensure_ascii=False))
+          print("TOTAL_MATCHED_SIGNATURES",int(matched.n_signatures.sum()))
+
+          # Probe the CDS-DB Download All archive itself.
+          durl="http://cdsdb.cloudna.cn/apiFlask/downloadData?id=&level=dataset"
+          rr=requests.get(durl,headers=UA,timeout=300,allow_redirects=True)
+          print("CDS_ARCHIVE",rr.status_code,len(rr.content),rr.headers.get("content-type"),rr.url,rr.content[:8])
+          if rr.status_code==200 and len(rr.content)>100:
+              open("/tmp/cds_all.bin","wb").write(rr.content)
+              try:
+                  tf=tarfile.open(fileobj=io.BytesIO(rr.content),mode="r:*")
+                  names=tf.getnames()
+                  print("TAR_MEMBERS",len(names))
+                  print("TAR_HEAD",json.dumps(names[:100],ensure_ascii=False))
+              except Exception as e:
+                  print("TAR_OPEN_ERR",repr(e))
+          PY
