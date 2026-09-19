@@ -89,7 +89,7 @@ jobs:
               # expected fields are x_group / hue_group / value / count or similar
               xcol=next((c for c in ["x_group","x_value","group_value","oncotree_code"] if c in d.columns),None)
               hcol=next((c for c in ["hue_group","hue_value","short_name"] if c in d.columns),None)
-              vcol=next((c for c in ["value","mean_value","agg_value","mean","z_score"] if c in d.columns),None)
+              vcol=next((c for c in ["aggregated_value","value","mean_value","agg_value","mean","z_score"] if c in d.columns),None)
               ncol=next((c for c in ["count","sample_count","n","n_samples"] if c in d.columns),None)
               if not all([xcol,hcol,vcol]):
                   raise RuntimeError(f"Unknown aggregate schema {list(d.columns)}")
@@ -244,7 +244,7 @@ jobs:
           ev=read_ot("evidence_clinical_precedence",["drugId","diseaseId","clinicalStage"])
           stage={"UNKNOWN":0.0,"PRECLINICAL":0.1,"IND":0.5,"EARLY_PHASE_1":0.75,
                  "PHASE_1":1.0,"PHASE_1_2":1.5,"PHASE_2":2.0,"PHASE_2_3":2.5,
-                 "PHASE_3":3.0,"PREAPPROVAL":3.5,"APPROVAL":4.0,"PHASE_4":4.0,"WITHDRAWAL":4.0}
+                 "PHASE_3":3.0,"PREAPPROVAL":3.5,"APPROVAL":4.0,"PHASE_4":4.0,"WITHDRAWAL":0.0}
           ev["stage"]=ev.clinicalStage.astype(str).map(stage).fillna(0)
           evmax=ev.groupby(["drugId","diseaseId"],as_index=False).stage.max()
           pairs=bias.copy()
