@@ -1,0 +1,80 @@
+name: O06 natural knockout data probe
+
+on:
+  push:
+    branches:
+      - o06-natural-knockout-cancer-dependency-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl lxml
+      - name: Recover PMC OA supplementary files
+        shell: bash
+        run: |
+          mkdir -p o06_probe
+          cat > /tmp/o06_probe.py <<'PY'
+          import io,os,re,json,tarfile,requests,xml.etree.ElementTree as ET
+          from pathlib import Path
+          import pandas as pd
+          OUT=Path("o06_probe"); OUT.mkdir(exist_ok=True)
+          H={"User-Agent":"o06-natural-knockout/0.1"}
+          oa="https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id=PMC13193078"
+          r=requests.get(oa,headers=H,timeout=120)
+          print("OA_API",r.status_code,len(r.content),r.text[:5000])
+          r.raise_for_status()
+          root=ET.fromstring(r.content)
+          hrefs=[x.attrib.get("href") for x in root.iter() if x.attrib.get("href")]
+          print("OA_HREFS",json.dumps(hrefs,indent=2))
+          pkg=None
+          for h in hrefs:
+              if h and (h.endswith(".tar.gz") or "ftp.ncbi.nlm.nih.gov" in h):
+                  pkg=h.replace("ftp://","https://"); break
+          if not pkg: raise RuntimeError("No OA package URL")
+          rr=requests.get(pkg,headers=H,timeout=300)
+          print("PKG",pkg,rr.status_code,len(rr.content),rr.headers.get("content-type"))
+          rr.raise_for_status()
+          tf=tarfile.open(fileobj=io.BytesIO(rr.content),mode="r:gz")
+          names=tf.getnames()
+          print("MEMBERS",len(names))
+          print("NAMES",json.dumps(names[:500],indent=2))
+          for m in tf.getmembers():
+              if not m.isfile(): continue
+              bn=Path(m.name).name
+              if re.search(r'(supp|table|xlsx|xls|csv|tsv|zip)',bn,re.I):
+                  d=tf.extractfile(m).read()
+                  dest=OUT/bn; dest.write_bytes(d)
+                  print("EXTRACT",bn,len(d))
+          # inspect tabular supplements
+          for p in OUT.iterdir():
+              if p.suffix.lower() in [".xlsx",".xls"]:
+                  try:
+                      xf=pd.ExcelFile(p)
+                      print("XLS",p.name,xf.sheet_names)
+                      for sh in xf.sheet_names:
+                          df=pd.read_excel(p,sheet_name=sh,nrows=10)
+                          print("SHEET",p.name,sh,"SHAPE_HEAD",df.shape)
+                          print("COLS",json.dumps([str(c) for c in df.columns],ensure_ascii=False))
+                          print("HEAD",df.head(5).to_json(orient="records",force_ascii=False)[:10000])
+                  except Exception as e: print("XLS_ERR",p.name,repr(e))
+              elif p.suffix.lower() in [".csv",".tsv"]:
+                  try:
+                      sep="\t" if p.suffix.lower()==".tsv" else ","
+                      df=pd.read_csv(p,sep=sep,nrows=10)
+                      print("TAB",p.name,"COLS",json.dumps([str(c) for c in df.columns]))
+                      print("HEAD",df.head().to_json(orient="records")[:10000])
+                  except Exception as e: print("TAB_ERR",p.name,repr(e))
+          PY
+          python /tmp/o06_probe.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o06-natural-knockout-probe
+          path: o06_probe/
+          retention-days: 5
