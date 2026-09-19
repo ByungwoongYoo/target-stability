@@ -1,0 +1,171 @@
+name: O07 supplement recovery
+
+on:
+  push:
+    branches:
+      - o07-autoimmune-cross-lineage-20260919
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl beautifulsoup4 lxml
+      - name: Recover Zenodo and PMC supplements
+        shell: bash
+        run: |
+          mkdir -p o07_recover
+          cat > /tmp/o07_recover.py <<'PY'
+          import io,json,re,tarfile,zipfile,gzip,hashlib,time
+          from pathlib import Path
+          import requests,pandas as pd
+          from bs4 import BeautifulSoup
+
+          OUT=Path("o07_recover"); OUT.mkdir(exist_ok=True)
+          H={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
+             "Accept":"*/*"}
+          S=requests.Session(); S.headers.update(H)
+
+          def get(url, **kw):
+              err=None
+              for a in range(5):
+                  try:
+                      r=S.get(url,timeout=180,allow_redirects=True,**kw)
+                      print("GET",a+1,r.status_code,len(r.content),r.headers.get("content-type"),r.url)
+                      if r.status_code < 500 and r.status_code not in (429,):
+                          return r
+                      err=RuntimeError(f"status={r.status_code}")
+                  except Exception as e:
+                      err=e; print("GETERR",repr(e))
+                  time.sleep(2*(a+1))
+              raise err
+
+          def save_and_inspect(data,name):
+              p=OUT/name; p.write_bytes(data)
+              print("SAVED",name,len(data),hashlib.sha256(data).hexdigest())
+              # Excel
+              try:
+                  xf=pd.ExcelFile(io.BytesIO(data))
+                  print("XLS",name,"SHEETS",json.dumps(xf.sheet_names))
+                  for sh in xf.sheet_names:
+                      try:
+                          raw=pd.read_excel(io.BytesIO(data),sheet_name=sh,header=None,nrows=12)
+                          print("RAW",name,sh,raw.to_json(orient="split",default_handler=str)[:10000])
+                          df=pd.read_excel(io.BytesIO(data),sheet_name=sh,nrows=8)
+                          print("HDR",name,sh,json.dumps([str(c) for c in df.columns[:150]]))
+                      except Exception as e: print("SHEETERR",name,sh,repr(e))
+                  return
+              except Exception as e:
+                  print("NOT_XLS",name,repr(e))
+              # zip/tar
+              try:
+                  z=zipfile.ZipFile(io.BytesIO(data))
+                  print("ZIP",name,json.dumps(z.namelist()[:300]))
+              except: pass
+              try:
+                  t=tarfile.open(fileobj=io.BytesIO(data),mode="r:*")
+                  print("TAR",name,json.dumps(t.getnames()[:300]))
+              except: pass
+
+          # -------- B CELL: Zenodo --------
+          print("=== B_ZENODO ===")
+          rz=get("https://zenodo.org/api/records/18828272")
+          print("ZENODO_PREFIX",rz.text[:5000])
+          if rz.status_code==200:
+              try:
+                  meta=rz.json()
+                  (OUT/"B_zenodo_record.json").write_text(json.dumps(meta,indent=2),encoding="utf-8")
+                  fs=meta.get("files") or []
+                  print("ZENODO_FILES",json.dumps([{"key":f.get("key"),"size":f.get("size"),"links":f.get("links")} for f in fs],indent=2)[:40000])
+                  for i,f in enumerate(fs):
+                      key=str(f.get("key",""))
+                      links=f.get("links") or {}
+                      if re.search(r'\.xlsx$|\.xls$|\.csv$|\.tsv$|\.zip$|\.tar',key,re.I) or re.search(r'supp|table|SCANDAL|SCEPTRE|target',key,re.I):
+                          u=links.get("content") or links.get("self")
+                          if not u: continue
+                          try:
+                              rr=get(u)
+                              if rr.status_code==200 and len(rr.content)>1000:
+                                  safe=re.sub(r'[^A-Za-z0-9_.-]+','_',key)[:160]
+                                  save_and_inspect(rr.content,"B_"+safe)
+                          except Exception as e: print("BFILEERR",key,repr(e))
+              except Exception as e: print("ZENODOJSONERR",repr(e))
+
+          # bioRxiv supplementary-material page
+          print("=== B_BIORXIV_SUPP ===")
+          rb=get("https://www.biorxiv.org/content/10.64898/2026.03.01.708923v1.supplementary-material")
+          (OUT/"B_supp_page.html").write_bytes(rb.content)
+          soup=BeautifulSoup(rb.text,"lxml")
+          blinks=[]
+          for a in soup.find_all("a",href=True):
+              href=requests.compat.urljoin(rb.url,a["href"])
+              txt=a.get_text(" ",strip=True)
+              if re.search(r'supp|table|xlsx|xls|csv|zip|media|download',txt+" "+href,re.I):
+                  blinks.append((txt,href))
+          print("B_SUPP_LINKS",json.dumps(blinks,indent=2)[:30000])
+          for i,(txt,u) in enumerate(blinks):
+              if re.search(r'\.xlsx|\.xls|\.csv|\.tsv|\.zip|\.tar|\.gz',u,re.I):
+                  try:
+                      rr=get(u)
+                      if rr.status_code==200 and len(rr.content)>1000:
+                          save_and_inspect(rr.content,f"B_biorxiv_{i}_"+re.sub(r'[^A-Za-z0-9_.-]+','_',u.split('/')[-1])[:120])
+                  except Exception as e: print("BSUPPERR",u,repr(e))
+
+          # -------- T CELL: PMC OA service / static mirrors --------
+          print("=== T_PMC_OA ===")
+          oa=get("https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi?id=PMC13060838")
+          print("OA_XML",oa.text[:10000])
+          (OUT/"T_oa.xml").write_bytes(oa.content)
+          # extract archive URLs
+          urls=re.findall(r'href="([^"]+)"',oa.text)
+          for i,u in enumerate(urls):
+              try:
+                  rr=get(u)
+                  if rr.status_code==200 and len(rr.content)>1000:
+                      save_and_inspect(rr.content,f"T_oa_{i}_"+re.sub(r'[^A-Za-z0-9_.-]+','_',u.split('/')[-1])[:120])
+                      # if tar package, extract xlsx members and inspect
+                      try:
+                          tf=tarfile.open(fileobj=io.BytesIO(rr.content),mode="r:*")
+                          for m in tf.getmembers():
+                              if m.isfile() and re.search(r'\.(xlsx|xls|csv|tsv)$',m.name,re.I):
+                                  d=tf.extractfile(m).read()
+                                  save_and_inspect(d,"T_pkg_"+re.sub(r'[^A-Za-z0-9_.-]+','_',m.name)[-160:])
+                      except Exception as e: print("PKGTARERR",repr(e))
+              except Exception as e: print("OAURLERR",u,repr(e))
+
+          # Try multiple static forms for every media-x.
+          print("=== T_DIRECT ===")
+          templates=[
+            "https://pmc.ncbi.nlm.nih.gov/articles/instance/13060838/bin/media-{i}.xlsx?download=1",
+            "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC13060838/bin/media-{i}.xlsx",
+            "https://pmc.ncbi.nlm.nih.gov/articles/PMC13060838/bin/media-{i}.xlsx",
+          ]
+          for i in range(2,16):
+              ok=False
+              for ti,tpl in enumerate(templates):
+                  u=tpl.format(i=i)
+                  try:
+                      rr=get(u,headers={**H,"Referer":"https://pmc.ncbi.nlm.nih.gov/articles/PMC13060838/"})
+                      sig=rr.content[:4]
+                      print("TDIRECT",i,ti,rr.status_code,len(rr.content),rr.headers.get("content-type"),sig)
+                      if rr.status_code==200 and len(rr.content)>2000 and rr.content[:2]==b"PK":
+                          save_and_inspect(rr.content,f"T_media-{i}.xlsx")
+                          ok=True; break
+                  except Exception as e: print("TDIRECTERR",i,ti,repr(e))
+              print("T_MEDIA_DONE",i,ok)
+
+          print("=== FINAL_FILES ===")
+          for p in sorted(OUT.iterdir()):
+              if p.is_file(): print(p.name,p.stat().st_size)
+          PY
+          python /tmp/o07_recover.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o07-supplement-recovery
+          path: o07_recover/
+          retention-days: 5
