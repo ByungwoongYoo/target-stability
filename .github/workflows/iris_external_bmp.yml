@@ -16,7 +16,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install pandas numpy scikit-learn requests mygene
+      - run: pip install pandas numpy scikit-learn requests
       - run: python iris_external_bmp/run_bmp.py
       - uses: actions/upload-artifact@v4
         if: always()
