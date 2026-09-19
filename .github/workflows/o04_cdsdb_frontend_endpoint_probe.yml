@@ -1,0 +1,50 @@
+name: O04 CDSDB frontend endpoint probe
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests beautifulsoup4
+      - name: Probe frontend API endpoints
+        run: |
+          python - <<'PY'
+          import requests,re,json
+          from bs4 import BeautifulSoup
+          base="http://cdsdb.ncpsb.org.cn"
+          H={"User-Agent":"Mozilla/5.0"}
+          html=requests.get(base+"/analysisResult?level=raw/dataset&jobId=CDS_dataset_Microarray_116",headers=H,timeout=120).text
+          srcs=re.findall(r'<script[^>]+src="([^"]+)"',html)
+          print("SCRIPTS",json.dumps(srcs))
+          pats=[r'analysisResults',r'analysisResult',r'logFC',r'pValue',r'downloadData',r'deg',r're.?analy',r'jobId',r'raw/dataset']
+          for src in srcs:
+              if not src.startswith("http"): src=base+src
+              try:
+                  txt=requests.get(src,headers=H,timeout=120).text
+              except Exception as e:
+                  print("FETCH_ERR",src,repr(e)); continue
+              hits=[]
+              for p in pats:
+                  for m in re.finditer(p,txt,re.I):
+                      a=max(0,m.start()-600); b=min(len(txt),m.end()+1200)
+                      hits.append((m.start(),p,txt[a:b]))
+              if hits:
+                  print("=== FILE",src,"LEN",len(txt),"===")
+                  seen=set()
+                  for pos,p,s in sorted(hits)[:200]:
+                      key=s[:300]
+                      if key in seen: continue
+                      seen.add(key)
+                      print("HIT",p,"POS",pos)
+                      print(s)
+                      print("---")
+          PY
