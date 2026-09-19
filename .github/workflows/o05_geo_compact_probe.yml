@@ -1,0 +1,56 @@
+name: O05 GEO compact object probe
+
+on:
+  push:
+    branches:
+      - o05-cross-species-proteome-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: '4.5.1'
+      - name: Probe RDS objects without retaining large files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            gse=$((325521+i))
+            url="https://ftp.ncbi.nlm.nih.gov/geo/series/GSE325nnn/GSE${gse}/suppl/GSE${gse}_meta.mat.human.egid${i}.rds"
+            echo "URL $url"
+            curl -L --retry 3 --fail --silent --show-error -o "/tmp/x${i}.rds" "$url"
+            ls -lh "/tmp/x${i}.rds"
+            Rscript - "/tmp/x${i}.rds" <<'RS'
+args <- commandArgs(trailingOnly=TRUE)
+x <- readRDS(args[1])
+cat("CLASS", paste(class(x),collapse=","), "\n")
+if (is.list(x)) {
+  cat("NAMES", paste(names(x),collapse="|"), "\n")
+  for (nm in names(x)) {
+    y <- x[[nm]]
+    cat("ITEM",nm,"CLASS",paste(class(y),collapse=","),"DIM",
+        paste(dim(y),collapse="x"),"LEN",length(y),"\n")
+    if (is.data.frame(y)) {
+      cat("COLS",nm,paste(colnames(y),collapse="|"),"\n")
+      print(utils::head(y,3))
+    } else if (is.matrix(y) || inherits(y,"Matrix")) {
+      cat("ROWNAMES_HEAD",paste(head(rownames(y),5),collapse="|"),"\n")
+      cat("COLNAMES_HEAD",paste(head(colnames(y),10),collapse="|"),"\n")
+      print(y[seq_len(min(3,nrow(y))),seq_len(min(5,ncol(y))),drop=FALSE])
+    } else {
+      print(utils::head(y,5))
+    }
+  }
+} else {
+  cat("DIM",paste(dim(x),collapse="x"),"LEN",length(x),"\n")
+  if (is.data.frame(x)) {
+    cat("COLS",paste(colnames(x),collapse="|"),"\n")
+    print(utils::head(x,3))
+  }
+}
+RS
+            rm "/tmp/x${i}.rds"
+          done
