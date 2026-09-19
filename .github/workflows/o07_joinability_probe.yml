@@ -46,26 +46,21 @@ jobs:
           arr=rr.json()
           files=[x for x in arr if x.get("type")=="file"]
           print("HF_FILES",json.dumps([{"path":x.get("path"),"size":x.get("size")} for x in files],indent=2)[:30000])
-          parq=[x for x in files if str(x.get("path","")).endswith(".parquet")]
-          print("PARQUET_N",len(parq))
-          if not parq: raise RuntimeError("No parquet files")
-          # Load first parquet, and all if modest
+          csvs=[x for x in files if str(x.get("path","")).endswith(".csv.gz")]
+          print("CSV_N",len(csvs))
+          if not csvs: raise RuntimeError("No csv.gz files")
           dfs=[]
-          totalbytes=sum((x.get("size") or 0) for x in parq)
-          print("PARQUET_TOTAL_BYTES",totalbytes)
-          for x in parq:
+          for x in csvs:
               path=x["path"]
               url="https://huggingface.co/datasets/opentargets/clinical_evidence/resolve/main/"+path
               z=requests.get(url,headers=H,timeout=300,allow_redirects=True)
-              print("PARQ_GET",path,z.status_code,len(z.content),z.headers.get("content-type"))
+              print("CSV_GET",path,z.status_code,len(z.content),z.headers.get("content-type"))
               z.raise_for_status()
-              df=pd.read_parquet(io.BytesIO(z.content))
-              print("PARQ",path,"SHAPE",df.shape)
+              df=pd.read_csv(io.BytesIO(z.content),compression="gzip",low_memory=False)
+              print("CSV",path,"SHAPE",df.shape)
               print("COLS",json.dumps(df.columns.tolist()))
               print("HEAD",df.head(3).to_json(orient="records",default_handler=str)[:15000])
               dfs.append(df)
-              # Don't risk memory if many shards
-              if sum(len(d) for d in dfs)>1000000: break
           d=pd.concat(dfs,ignore_index=True)
           print("LOADED_ROWS",len(d))
           # Common identifiers / reasons
