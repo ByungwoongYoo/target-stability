@@ -1,0 +1,26 @@
+name: IRIS external BMP gate
+on:
+  push:
+    branches: [iris-validation-sol-20260919]
+    paths:
+      - 'iris_external_bmp/**'
+      - '.github/workflows/iris_external_bmp.yml'
+permissions:
+  contents: read
+jobs:
+  bmp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install pandas numpy scikit-learn requests mygene
+      - run: python iris_external_bmp/run_bmp.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: iris-external-bmp-results
+          path: iris_external_bmp/results/
+          if-no-files-found: warn
