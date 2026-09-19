@@ -1,0 +1,119 @@
+name: O01 Mendeley browser-session API
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  browser_api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install playwright pandas openpyxl
+          python -m playwright install --with-deps chromium
+      - name: Query Mendeley API inside browser session
+        shell: bash
+        run: |
+          cat > /tmp/mend_api.py <<'PY'
+          import asyncio,json,re,os,io,zipfile
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+          import pandas as pd
+
+          URL="https://data.mendeley.com/datasets/hr94h42xdc/3"
+          API="https://data.mendeley.com/public-api/datasets/hr94h42xdc/files?folder_id=root&version=3"
+          OUT=Path("mend_api"); OUT.mkdir(exist_ok=True)
+
+          async def main():
+            async with async_playwright() as p:
+              b=await p.chromium.launch(headless=True)
+              ctx=await b.new_context(
+                accept_downloads=True,
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"
+              )
+              pg=await ctx.new_page()
+              await pg.goto(URL,wait_until="domcontentloaded",timeout=120000)
+              await pg.wait_for_timeout(3000)
+              print("PAGE",await pg.title(),pg.url)
+
+              # Same-origin browser fetch, reusing Cloudflare/session state.
+              res=await pg.evaluate("""async (u) => {
+                const r=await fetch(u,{credentials:'include',headers:{'accept':'application/json'}});
+                const txt=await r.text();
+                return {status:r.status,url:r.url,ctype:r.headers.get('content-type'),text:txt};
+              }""",API)
+              print("API_STATUS",res["status"],res["ctype"],res["url"])
+              print("API_PREFIX",res["text"][:2000])
+              (OUT/"api_response.txt").write_text(res["text"],encoding="utf-8")
+              files=None
+              try: files=json.loads(res["text"])
+              except Exception as e: print("API_JSON_ERR",repr(e))
+              if isinstance(files,dict):
+                for k in ["results","files","items"]:
+                  if isinstance(files.get(k),list): files=files[k]; break
+              if isinstance(files,list):
+                print("FILE_COUNT",len(files))
+                slim=[]
+                for f in files:
+                  u=(f.get("content_details") or {}).get("download_url") or f.get("download_url") or f.get("url")
+                  slim.append({"id":f.get("id"),"filename":f.get("filename") or f.get("name"),
+                               "size":f.get("size") or f.get("file_size"),"download_url":u})
+                print("FILES",json.dumps(slim,indent=2,default=str))
+                (OUT/"files.json").write_text(json.dumps(slim,indent=2,default=str),encoding="utf-8")
+                # Prefer Data S5/DSS; else download all plausible tabular files small enough.
+                cand=[x for x in slim if re.search(r'(data.?s5|dss|drug.?sensitivity.?score)',str(x.get("filename")),re.I)]
+                if not cand:
+                  cand=[x for x in slim if re.search(r'\.(csv|xlsx|tsv|zip)$',str(x.get("filename")),re.I)]
+                print("CANDIDATES",json.dumps(cand,indent=2))
+                for j,x in enumerate(cand[:10]):
+                  u=x.get("download_url")
+                  if not u: continue
+                  try:
+                    # Browser-context request inherits cookies; signed external URLs also work.
+                    rr=await ctx.request.get(u,timeout=120000)
+                    body=await rr.body()
+                    name=x.get("filename") or f"candidate_{j}"
+                    dest=OUT/name
+                    dest.write_bytes(body)
+                    print("DOWNLOADED",name,rr.status,len(body),rr.headers.get("content-type"))
+                    if re.search(r'(s5|dss)',name,re.I):
+                      # Inspect likely table locally.
+                      try:
+                        if name.lower().endswith((".xlsx",".xls")) or body[:2]==b"PK":
+                          xf=pd.ExcelFile(io.BytesIO(body))
+                          print("S5_SHEETS",xf.sheet_names)
+                          for sh in xf.sheet_names:
+                            df=pd.read_excel(io.BytesIO(body),sheet_name=sh)
+                            print("S5_SHEET",sh,"SHAPE",df.shape)
+                            print("S5_COLUMNS",json.dumps([str(c) for c in df.columns[:120]]))
+                            print("S5_HEAD",df.head(5).to_json(orient="records"))
+                        else:
+                          try: df=pd.read_csv(io.BytesIO(body))
+                          except: df=pd.read_csv(io.BytesIO(body),sep="\t")
+                          print("S5_SHAPE",df.shape)
+                          print("S5_COLUMNS",json.dumps([str(c) for c in df.columns[:120]]))
+                          print("S5_HEAD",df.head(5).to_json(orient="records"))
+                      except Exception as e: print("S5_INSPECT_ERR",repr(e))
+                  except Exception as e:
+                    print("DOWNLOAD_ERR",x,repr(e))
+              await b.close()
+
+          asyncio.run(main())
+          PY
+          python /tmp/mend_api.py
+      - name: List outputs
+        if: always()
+        run: find mend_api -maxdepth 2 -type f -printf '%p %s bytes\n' | sort || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o01-mendeley-browser-api
+          path: mend_api/
+          retention-days: 3
+          if-no-files-found: warn
