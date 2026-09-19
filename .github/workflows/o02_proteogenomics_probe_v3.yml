@@ -1,0 +1,132 @@
+name: O02 proteogenomics probe v3
+
+on:
+  push:
+    branches:
+      - o02-cross-ancestry-proteogenomics-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install requests pandas openpyxl playwright
+          python -m playwright install --with-deps chromium
+      - name: Recover files
+        shell: bash
+        run: |
+          mkdir -p o02_probe_v3
+          cat > /tmp/o02_v3.py <<'PY'
+          import asyncio,json,re,time,hashlib,zipfile,io
+          from pathlib import Path
+          import requests,pandas as pd
+          from playwright.async_api import async_playwright
+
+          OUT=Path("o02_probe_v3"); OUT.mkdir(exist_ok=True)
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"
+          def rget(u,tries=4):
+              last=None
+              for i in range(tries):
+                  try:
+                      r=requests.get(u,headers={"User-Agent":UA},timeout=180,allow_redirects=True)
+                      print("REQ",i,r.status_code,r.headers.get("content-type"),len(r.content),r.url)
+                      if r.status_code==200:return r
+                      last=RuntimeError(r.status_code)
+                  except Exception as e:last=e
+                  time.sleep(2*(i+1))
+              raise last
+
+          eas=None
+          eas_urls=[
+            "https://zenodo.org/api/records/21503247/files/Supplementary%20Tables.xlsx/content",
+            "https://zenodo.org/records/21503247/files/Supplementary%20Tables.xlsx?download=1",
+            "https://zenodo.org/records/21503247/files/Supplementary%20Tables.xlsx",
+          ]
+          for u in eas_urls:
+              try:
+                  r=rget(u)
+                  if r.content[:2]==b"PK" and len(r.content)>100000:
+                      eas=OUT/"EAS.xlsx";eas.write_bytes(r.content);print("EAS_OK",u,len(r.content));break
+              except Exception as e: print("EAS_FAIL",u,repr(e))
+
+          async def browsers(eas_missing):
+              res={"eas":None,"eur":[]}
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context(accept_downloads=True,user_agent=UA)
+                  if eas_missing:
+                      pg=await ctx.new_page()
+                      for u in eas_urls:
+                          try:
+                              rr=await ctx.request.get(u,timeout=180000)
+                              body=await rr.body()
+                              print("EAS_BROWSER_DIRECT",rr.status,rr.headers.get("content-type"),len(body),u)
+                              if rr.status==200 and body[:2]==b"PK":
+                                  q=OUT/"EAS.xlsx";q.write_bytes(body);res["eas"]=str(q);break
+                          except Exception as e:print("EAS_BROWSER_DIRECT_ERR",u,repr(e))
+                      await pg.close()
+
+                  pg=await ctx.new_page()
+                  supp="https://www.medrxiv.org/content/10.64898/2026.07.23.26358667v1.supplementary-material"
+                  await pg.goto(supp,wait_until="domcontentloaded",timeout=120000)
+                  await pg.wait_for_timeout(2500)
+                  print("EUR_SUPP_TITLE",await pg.title(),pg.url)
+                  links=await pg.locator("a").evaluate_all("""els=>els.map(e=>({text:(e.innerText||'').trim(),href:e.href||'',download:e.download||''}))""")
+                  cand=[x for x in links if re.search(r'\.xlsx|\.xls|\.zip|download|supp|media|DC\d|content',json.dumps(x),re.I)]
+                  print("EUR_INNER_LINKS",json.dumps(cand[:150],indent=2))
+                  (OUT/"eur_supp_links.json").write_text(json.dumps(links,indent=2),encoding="utf-8")
+                  seen=set()
+                  for i,x in enumerate(cand[:80]):
+                      u=x.get("href")
+                      if not u or u in seen: continue
+                      seen.add(u)
+                      try:
+                          rr=await ctx.request.get(u,timeout=180000)
+                          body=await rr.body();ct=rr.headers.get("content-type","")
+                          print("EUR_INNER_GET",i,rr.status,ct,len(body),u)
+                          if rr.status==200 and len(body)>10000 and body[:2]==b"PK":
+                              ext=".zip" if ("zip" in ct.lower() or u.lower().split("?")[0].endswith(".zip")) else ".xlsx"
+                              q=OUT/f"EUR_{len(res['eur'])}{ext}";q.write_bytes(body);res["eur"].append(str(q))
+                      except Exception as e:print("EUR_INNER_ERR",u,repr(e))
+                  await b.close()
+              return res
+          br=asyncio.run(browsers(eas is None))
+          if eas is None and br["eas"]: eas=Path(br["eas"])
+          eur=[Path(x) for x in br["eur"]]
+
+          def ix(path,label):
+              try: xf=pd.ExcelFile(path)
+              except Exception as e: print("XERR",label,path,repr(e));return
+              print("SHEETS",label,json.dumps(xf.sheet_names))
+              for sh in xf.sheet_names:
+                  try:
+                      df=pd.read_excel(path,sheet_name=sh,nrows=5)
+                      print("SHEET",label,sh,"COLS",json.dumps([str(x) for x in df.columns[:100]]))
+                      print("HEAD",label,sh,df.head(2).to_json(orient="records",default_handler=str)[:4000])
+                  except Exception as e:print("SHERR",label,sh,repr(e))
+          if eas:ix(eas,"EAS")
+          for q in eur:
+              if q.suffix==".xlsx":ix(q,"EUR")
+              else:
+                  try:
+                      z=zipfile.ZipFile(q);print("ZIP",q,json.dumps(z.namelist()[:100]))
+                      for n in z.namelist():
+                          if n.lower().endswith((".xlsx",".xls")):
+                              p=OUT/("unz_"+Path(n).name);p.write_bytes(z.read(n));ix(p,"EURZIP")
+                  except Exception as e:print("ZIPERR",repr(e))
+          print("FILES")
+          for q in OUT.iterdir():
+              if q.is_file():print(q.name,q.stat().st_size,hashlib.sha256(q.read_bytes()).hexdigest())
+          PY
+          python /tmp/o02_v3.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o02-proteogenomics-probe-v3
+          path: o02_probe_v3/
+          retention-days: 3
