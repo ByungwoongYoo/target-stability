@@ -1,0 +1,144 @@
+name: O07 actual browser downloads
+
+on:
+  push:
+    branches:
+      - o07-autoimmune-cross-lineage-20260919
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install playwright pandas openpyxl
+          python -m playwright install --with-deps chromium
+      - name: Download supplements through browser session
+        shell: bash
+        run: |
+          mkdir -p o07_download
+          cat > /tmp/o07_download.py <<'PY'
+          import asyncio,io,json,re,hashlib
+          from pathlib import Path
+          import pandas as pd
+          from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+
+          OUT=Path("o07_download"); OUT.mkdir(exist_ok=True)
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"
+
+          def inspect(path,label):
+              data=Path(path).read_bytes()
+              print("FILE",label,len(data),data[:8],hashlib.sha256(data).hexdigest())
+              try:
+                  xf=pd.ExcelFile(io.BytesIO(data))
+                  print("XLS",label,json.dumps(xf.sheet_names))
+                  for sh in xf.sheet_names:
+                      raw=pd.read_excel(io.BytesIO(data),sheet_name=sh,header=None,nrows=12)
+                      print("RAW",label,sh,raw.to_json(orient="split",default_handler=str)[:12000])
+                      df=pd.read_excel(io.BytesIO(data),sheet_name=sh,nrows=8)
+                      print("HDR",label,sh,json.dumps([str(c) for c in df.columns[:160]]))
+              except Exception as e: print("XLSERR",label,repr(e))
+
+          async def click_download(pg,url,dest,label):
+              # Click a synthetic anchor so browser navigation/cookies are honored.
+              await pg.set_content(f'<html><body><a id="d" href="{url}">download</a></body></html>')
+              try:
+                  async with pg.expect_download(timeout=60000) as di:
+                      await pg.locator("#d").click()
+                  d=await di.value
+                  await d.save_as(str(dest))
+                  print("DOWNLOAD_OK",label,d.suggested_filename,d.url)
+                  inspect(dest,label)
+                  return True
+              except Exception as e:
+                  print("DOWNLOAD_FAIL",label,repr(e))
+                  return False
+
+          async def main():
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context(user_agent=UA,accept_downloads=True,ignore_https_errors=True)
+
+                  # B: establish a normal bioRxiv browser session first.
+                  pg=await ctx.new_page()
+                  try:
+                      await pg.goto("https://www.biorxiv.org/content/10.64898/2026.03.01.708923v1",wait_until="domcontentloaded",timeout=120000)
+                      await pg.wait_for_timeout(3000)
+                      print("B_MAIN",await pg.title(),pg.url)
+                  except Exception as e: print("B_MAIN_ERR",repr(e))
+                  ajax=await ctx.new_page()
+                  await ajax.goto("https://www.biorxiv.org/panels_ajax_tab/biorxiv_tab_data/node:5279601/1",wait_until="domcontentloaded",timeout=120000)
+                  txt=await ajax.locator("body").inner_text()
+                  m=re.search(r'https:\\/\\/www\.biorxiv\.org\\/content\\/biorxiv\\/early\\/2026\\/03\\/02\\/2026\.03\.01\.708923\\/DC1\\/embed\\/media-1\.zip\?download=true',txt)
+                  if m:
+                      burl=m.group(0).replace('\\/','/')
+                  else:
+                      burl="https://www.biorxiv.org/content/biorxiv/early/2026/03/02/2026.03.01.708923/DC1/embed/media-1.zip?download=true"
+                  print("B_URL",burl)
+                  bpg=await ctx.new_page()
+                  await click_download(bpg,burl,OUT/"B_supp.zip","B_supp_zip")
+                  await bpg.close(); await ajax.close(); await pg.close()
+
+                  # If zip downloaded, unpack Excel tables.
+                  zpath=OUT/"B_supp.zip"
+                  if zpath.exists():
+                      import zipfile
+                      z=zipfile.ZipFile(zpath)
+                      print("B_ZIP_NAMES",json.dumps(z.namelist(),ensure_ascii=False))
+                      for n in z.namelist():
+                          if re.search(r'\.(xlsx|xls|csv|tsv)$',n,re.I):
+                              d=z.read(n)
+                              fp=OUT/("B_"+re.sub(r'[^A-Za-z0-9_.-]+','_',n)[-180:])
+                              fp.write_bytes(d)
+                              if n.lower().endswith((".xlsx",".xls")): inspect(fp,fp.name)
+
+                  # T: establish PMC article session, then execute PoW by navigating to one attachment.
+                  tmain=await ctx.new_page()
+                  await tmain.goto("https://pmc.ncbi.nlm.nih.gov/articles/PMC13060838/",wait_until="domcontentloaded",timeout=120000)
+                  await tmain.wait_for_timeout(3000)
+                  print("T_MAIN",await tmain.title(),tmain.url)
+                  target="https://pmc.ncbi.nlm.nih.gov/articles/instance/13060838/bin/media-3.xlsx"
+                  chall=await ctx.new_page()
+                  try:
+                      await chall.goto(target,wait_until="domcontentloaded",timeout=120000)
+                  except Exception as e:
+                      print("T_CHALL_GOTO",repr(e))
+                  for sec in [2,5,10,20]:
+                      await chall.wait_for_timeout(sec*1000)
+                      cookies=await ctx.cookies("https://pmc.ncbi.nlm.nih.gov")
+                      pc=[c for c in cookies if "pow" in c["name"].lower()]
+                      print("T_WAIT",sec,"TITLE",await chall.title(),"URL",chall.url,"POW",json.dumps(pc))
+                      if pc: break
+                  # retry download for all supplement xlsx after challenge JS has had a chance.
+                  await chall.close()
+                  for i in range(2,16):
+                      u=f"https://pmc.ncbi.nlm.nih.gov/articles/instance/13060838/bin/media-{i}.xlsx"
+                      pg2=await ctx.new_page()
+                      ok=await click_download(pg2,u,OUT/f"T_media-{i}.xlsx",f"T_media-{i}")
+                      if not ok:
+                          # browser fetch after PoW; if binary save directly
+                          try:
+                              await pg2.goto("https://pmc.ncbi.nlm.nih.gov/articles/PMC13060838/",wait_until="domcontentloaded",timeout=60000)
+                              res=await pg2.evaluate("""async (u)=>{const r=await fetch(u,{credentials:'include'});const b=await r.arrayBuffer();return {s:r.status,ct:r.headers.get('content-type')||'',url:r.url,bytes:Array.from(new Uint8Array(b))};}""",u)
+                              body=bytes(res["bytes"])
+                              print("T_RETRY_FETCH",i,res["s"],res["ct"],len(body),res["url"],body[:4])
+                              if res["s"]==200 and body[:2]==b"PK":
+                                  fp=OUT/f"T_media-{i}.xlsx"; fp.write_bytes(body); inspect(fp,f"T_media-{i}")
+                          except Exception as e: print("T_RETRY_ERR",i,repr(e))
+                      await pg2.close()
+                  await tmain.close()
+                  await b.close()
+          asyncio.run(main())
+          print("FINAL",[(p.name,p.stat().st_size) for p in sorted(OUT.iterdir())])
+          PY
+          python /tmp/o07_download.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o07-actual-downloads
+          path: o07_download/
+          retention-days: 5
