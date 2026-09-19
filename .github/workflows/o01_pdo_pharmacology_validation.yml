@@ -183,8 +183,8 @@ jobs:
                   fs.append(tab.select(cols).to_pandas())
               return pd.concat(fs,ignore_index=True),schema
 
-          drugs,drug_schema=read_ot("drug",["id","name","synonyms","tradeNames"])
-          moa,moa_schema=read_ot("mechanism_of_action",None)
+          drugs,drug_schema=read_ot("drug_molecule",["id","name","synonyms","tradeNames"])
+          moa,moa_schema=read_ot("drug_mechanism_of_action",None)
           targets,_=read_ot("target",["id","approvedSymbol"])
           tmap=dict(zip(targets.id.astype(str),targets.approvedSymbol.astype(str)))
           print("DRUG_SCHEMA",drug_schema)
