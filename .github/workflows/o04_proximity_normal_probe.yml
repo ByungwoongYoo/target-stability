@@ -1,0 +1,105 @@
+name: O04 proximity-normal AND-gate probe
+
+on:
+  push:
+    branches:
+      - o04-proximity-normal-andgate-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install requests pandas openpyxl scipy cellxgene-census anndata pyarrow
+      - name: Probe proximity atlas and Tabula Sapiens v2
+        shell: bash
+        run: |
+          mkdir -p o04_probe
+          cat > /tmp/o04_probe.py <<'PY'
+          import io, json, re, hashlib
+          from pathlib import Path
+          import requests, pandas as pd, numpy as np
+
+          OUT=Path("o04_probe")
+          H={"User-Agent":"o04-probe/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+
+          # 1) Nature 2026 proximity atlas Zenodo
+          rec=requests.get("https://zenodo.org/api/records/21678744",headers=H,timeout=120)
+          print("ZENODO_STATUS",rec.status_code)
+          rec.raise_for_status()
+          meta=rec.json()
+          files=meta.get("files",[])
+          print("ZENODO_TITLE",meta.get("metadata",{}).get("title"))
+          print("ZENODO_FILES",json.dumps([
+              {"key":f.get("key"),"size":f.get("size"),"links":f.get("links",{})}
+              for f in files
+          ],indent=2)[:30000])
+          (OUT/"zenodo_record.json").write_text(json.dumps(meta,indent=2),encoding="utf-8")
+
+          downloaded=[]
+          for f in files:
+              key=str(f.get("key",""))
+              if not re.search(r'\.(xlsx|xls|csv|tsv)$',key,re.I):
+                  continue
+              if int(f.get("size") or 0)>150_000_000:
+                  print("SKIP_LARGE",key,f.get("size")); continue
+              url=(f.get("links") or {}).get("content") or (f.get("links") or {}).get("self")
+              if not url: continue
+              rr=requests.get(url,headers=H,timeout=300)
+              print("FILE_GET",key,rr.status_code,len(rr.content),rr.headers.get("content-type"))
+              if rr.status_code==200:
+                  p=OUT/key.replace("/","_")
+                  p.write_bytes(rr.content); downloaded.append(p)
+
+          def inspect(path):
+              print("INSPECT",path.name,path.stat().st_size)
+              if path.suffix.lower() in [".xlsx",".xls"]:
+                  xf=pd.ExcelFile(path)
+                  print("SHEETS",path.name,json.dumps(xf.sheet_names))
+                  for sh in xf.sheet_names:
+                      try:
+                          raw=pd.read_excel(path,sheet_name=sh,nrows=8)
+                          print("SHEET",sh,"COLS",json.dumps([str(x) for x in raw.columns]))
+                          print("HEAD",raw.head(3).to_json(orient="records",default_handler=str)[:8000])
+                      except Exception as e: print("SHEET_ERR",sh,repr(e))
+              else:
+                  try:
+                      df=pd.read_csv(path,sep=None,engine="python",nrows=8)
+                      print("COLS",json.dumps([str(x) for x in df.columns]))
+                      print("HEAD",df.head(3).to_json(orient="records",default_handler=str)[:8000])
+                  except Exception as e: print("CSV_ERR",repr(e))
+          for p in downloaded: inspect(p)
+
+          # 2) CELLxGENE Census: confirm Tabula Sapiens v2 availability and schema.
+          import cellxgene_census
+          print("CELLXGENE_CENSUS_VERSION",getattr(cellxgene_census,"__version__","unknown"))
+          with cellxgene_census.open_soma(census_version="stable") as census:
+              ds=census["census_info"]["datasets"].read().concat().to_pandas()
+              cols=[c for c in ["dataset_id","dataset_title","collection_name","dataset_h5ad_path","dataset_total_cell_count"] if c in ds.columns]
+              hit=ds[ds.astype(str).apply(lambda r:r.str.contains("Tabula Sapiens",case=False,regex=False).any(),axis=1)]
+              print("TABULA_DATASETS",hit[cols].to_json(orient="records")[:30000])
+              (OUT/"tabula_datasets.json").write_text(hit[cols].to_json(orient="records",indent=2),encoding="utf-8")
+
+              # Homo sapiens obs/var schema only; no huge matrix download.
+              obs=census["census_data"]["homo_sapiens"].obs
+              var=census["census_data"]["homo_sapiens"].ms["RNA"].var
+              print("OBS_SCHEMA",str(obs.schema))
+              print("VAR_SCHEMA",str(var.schema))
+
+          print("FILES")
+          for p in OUT.iterdir():
+              if p.is_file():
+                  print(p.name,p.stat().st_size,hashlib.sha256(p.read_bytes()).hexdigest())
+          PY
+          python /tmp/o04_probe.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o04-proximity-normal-probe
+          path: o04_probe/
+          retention-days: 3
