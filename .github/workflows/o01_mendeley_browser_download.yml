@@ -1,0 +1,140 @@
+name: O01 Mendeley browser download
+
+on:
+  push:
+    branches:
+      - o01-execution-scratch-20260919
+
+jobs:
+  browser_download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install browser
+        run: |
+          pip install playwright
+          python -m playwright install --with-deps chromium
+      - name: Download public Mendeley dataset in browser
+        shell: bash
+        run: |
+          mkdir -p o01_mendeley_browser
+          cat > /tmp/mend_browser.py <<'PY'
+          import asyncio, json, os, re, time
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          URL="https://data.mendeley.com/datasets/hr94h42xdc/3"
+          OUT=Path("o01_mendeley_browser")
+          OUT.mkdir(exist_ok=True)
+
+          async def main():
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(headless=True)
+                  context=await browser.new_context(
+                      accept_downloads=True,
+                      user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36",
+                      viewport={"width":1440,"height":1200}
+                  )
+                  page=await context.new_page()
+                  responses=[]
+                  page.on("response", lambda r: responses.append({"url":r.url,"status":r.status,"ctype":r.headers.get("content-type","")}))
+                  await page.goto(URL, wait_until="domcontentloaded", timeout=120000)
+                  # Give Cloudflare/client JS time to settle.
+                  for _ in range(12):
+                      title=await page.title()
+                      body=(await page.locator("body").inner_text())[:3000]
+                      print("TITLE",title)
+                      print("URL",page.url)
+                      print("BODY_PREFIX",body[:1000].replace("\n"," | "))
+                      if "Just a moment" not in title and "Verify you are human" not in body:
+                          break
+                      await page.wait_for_timeout(5000)
+                  await page.screenshot(path=str(OUT/"page.png"), full_page=True)
+                  html=await page.content()
+                  (OUT/"page.html").write_text(html,encoding="utf-8")
+                  # Capture visible links/buttons for audit.
+                  links=await page.locator("a").evaluate_all("""els => els.map(e => ({text:(e.innerText||'').trim(),href:e.href||'',download:e.download||''})).filter(x=>x.text||x.href)""")
+                  buttons=await page.locator("button").evaluate_all("""els => els.map(e => ({text:(e.innerText||'').trim(),aria:e.getAttribute('aria-label')||'',title:e.getAttribute('title')||''}))""")
+                  (OUT/"links.json").write_text(json.dumps(links,indent=2),encoding="utf-8")
+                  (OUT/"buttons.json").write_text(json.dumps(buttons,indent=2),encoding="utf-8")
+                  print("LINKS_MATCH",json.dumps([x for x in links if re.search(r'download|file|s5|dss',json.dumps(x),re.I)][:50],indent=2))
+                  print("BUTTONS",json.dumps(buttons[:100],indent=2))
+                  got=[]
+                  # First try normal Download All button/link.
+                  candidates=[
+                      page.get_by_role("button", name=re.compile("Download All",re.I)),
+                      page.get_by_role("link", name=re.compile("Download All",re.I)),
+                      page.get_by_text(re.compile("^Download All$",re.I), exact=True),
+                  ]
+                  clicked=False
+                  for loc in candidates:
+                      try:
+                          if await loc.count():
+                              print("DOWNLOAD_ALL_FOUND",await loc.count())
+                              try:
+                                  async with page.expect_download(timeout=60000) as di:
+                                      await loc.first.click()
+                                  dl=await di.value
+                                  name=dl.suggested_filename
+                                  dest=OUT/name
+                                  await dl.save_as(str(dest))
+                                  print("DOWNLOAD_SAVED",name,dest.stat().st_size)
+                                  got.append(str(dest))
+                                  clicked=True
+                                  break
+                              except Exception as e:
+                                  print("DOWNLOAD_CLICK_NO_DIRECT_DOWNLOAD",repr(e))
+                                  # Maybe click opens modal/list.
+                                  try: await loc.first.click(timeout=5000)
+                                  except: pass
+                                  await page.wait_for_timeout(3000)
+                      except Exception as e:
+                          print("CANDIDATE_ERR",repr(e))
+                  # Inspect again after any modal/dialog opened.
+                  links2=await page.locator("a").evaluate_all("""els => els.map(e => ({text:(e.innerText||'').trim(),href:e.href||'',download:e.download||''})).filter(x=>x.text||x.href)""")
+                  buttons2=await page.locator("button").evaluate_all("""els => els.map(e => ({text:(e.innerText||'').trim(),aria:e.getAttribute('aria-label')||'',title:e.getAttribute('title')||''}))""")
+                  (OUT/"links_after.json").write_text(json.dumps(links2,indent=2),encoding="utf-8")
+                  (OUT/"buttons_after.json").write_text(json.dumps(buttons2,indent=2),encoding="utf-8")
+                  print("AFTER_MATCH",json.dumps([x for x in links2 if re.search(r'download|file|s5|dss|csv|xlsx|zip',json.dumps(x),re.I)][:100],indent=2))
+                  # Try individual visible file/download links if Download All did not directly download.
+                  if not got:
+                      hrefs=[]
+                      for x in links2:
+                          if x.get("href") and re.search(r'download|public-files|file_download|\.csv|\.xlsx|\.zip',x["href"],re.I):
+                              hrefs.append(x["href"])
+                      print("CANDIDATE_HREFS",json.dumps(hrefs[:100],indent=2))
+                      # Direct browser navigation to first plausible file URL, preferring s5/dss.
+                      hrefs=sorted(set(hrefs), key=lambda u:(0 if re.search(r's5|dss',u,re.I) else 1))
+                      for idx,u in enumerate(hrefs[:20]):
+                          try:
+                              async with page.expect_download(timeout=30000) as di:
+                                  await page.goto(u,wait_until="domcontentloaded",timeout=60000)
+                              dl=await di.value
+                              name=dl.suggested_filename or f"file_{idx}"
+                              dest=OUT/name
+                              await dl.save_as(str(dest))
+                              print("HREF_DOWNLOAD_SAVED",u,name,dest.stat().st_size)
+                              got.append(str(dest))
+                          except Exception as e:
+                              print("HREF_DOWNLOAD_FAIL",u,repr(e))
+                  (OUT/"responses.json").write_text(json.dumps(responses[-500:],indent=2),encoding="utf-8")
+                  print("DOWNLOADED",json.dumps(got))
+                  await browser.close()
+
+          asyncio.run(main())
+          PY
+          python /tmp/mend_browser.py
+      - name: List outputs
+        if: always()
+        run: find o01_mendeley_browser -maxdepth 2 -type f -printf '%p %s bytes\n' | sort
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o01-mendeley-browser
+          path: o01_mendeley_browser/
+          if-no-files-found: warn
+          retention-days: 3
