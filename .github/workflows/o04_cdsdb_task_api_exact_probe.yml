@@ -1,0 +1,31 @@
+name: O04 CDSDB task API exact probe
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests
+      - name: Extract exact task API code
+        run: |
+          python - <<'PY'
+          import requests,re
+          u="http://cdsdb.ncpsb.org.cn/js/chunk-95975456.b6ea44f4.js"
+          txt=requests.get(u,headers={"User-Agent":"Mozilla/5.0"},timeout=120).text
+          print("LEN",len(txt))
+          for needle in ["updateLogFCScript","getTaskStatus","taskStatus","updateDatasetLogFC","analysisResults","submitAdjusted"]:
+              print("\n===",needle,"===")
+              for m in re.finditer(re.escape(needle),txt):
+                  a=max(0,m.start()-2500); b=min(len(txt),m.end()+5000)
+                  print(txt[a:b])
+                  print("\n---")
+          PY
