@@ -1,0 +1,255 @@
+name: O04 CDSDB L1000 self-recovery pilot
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy scipy
+      - name: Run CDSDB to L1000FWD pilot
+        shell: bash
+        run: |
+          mkdir -p o04_pilot
+          cat > /tmp/o04.py <<'PY'
+          import io,tarfile,gzip,re,json,time,sys,os,hashlib
+          from pathlib import Path
+          import requests,pandas as pd,numpy as np
+          from scipy.stats import binomtest
+
+          OUT=Path("o04_pilot"); OUT.mkdir(exist_ok=True)
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"
+          S=requests.Session(); S.headers.update({"User-Agent":UA})
+          CDS="http://cdsdb.ncpsb.org.cn/apiFlask/downloadData?id=&level=dataset"
+          L1000="https://maayanlab.cloud/l1000fwd"
+
+          def get(url,**kw):
+              err=None
+              for a in range(6):
+                  try:
+                      r=S.get(url,timeout=240,allow_redirects=True,**kw)
+                      if r.status_code<500:
+                          r.raise_for_status(); return r
+                      err=RuntimeError(f"HTTP {r.status_code}")
+                  except Exception as e: err=e
+                  time.sleep(2*(a+1))
+              raise err
+
+          # Download all dataset-level CDS-DB archives.
+          p=OUT/"all_dataset.tar"
+          with S.get(CDS,stream=True,timeout=300,allow_redirects=True) as r:
+              print("CDS_DOWNLOAD",r.status_code,r.url,r.headers.get("content-type"),r.headers.get("content-length"))
+              r.raise_for_status()
+              with p.open("wb") as f:
+                  for ch in r.iter_content(1024*1024):
+                      if ch: f.write(ch)
+          print("CDS_FILE",p.stat().st_size,hashlib.sha256(p.read_bytes()).hexdigest())
+
+          def decode(b):
+              for enc in ["utf-8-sig","utf-8","gb18030","latin1"]:
+                  try:return b.decode(enc)
+                  except:pass
+              return b.decode("utf-8","replace")
+
+          def read_table_text(txt):
+              # auto-detect tab/comma; preserve strings.
+              try:return pd.read_csv(io.StringIO(txt),sep="\t",dtype=str)
+              except:return pd.read_csv(io.StringIO(txt),sep=None,engine="python",dtype=str)
+
+          top=tarfile.open(p,"r:*")
+          members=[m for m in top.getmembers() if m.isfile()]
+          print("TOP_MEMBERS",len(members),[m.name for m in members[:10]])
+
+          recs=[]
+          for mi,m in enumerate(members):
+              raw=top.extractfile(m).read()
+              try:
+                  nested=tarfile.open(fileobj=io.BytesIO(raw),mode="r:*")
+              except Exception as e:
+                  print("NESTED_OPEN_ERR",m.name,repr(e)); continue
+              nm={os.path.basename(x.name).lower():x for x in nested.getmembers() if x.isfile()}
+              if not {"metadata.txt","signature.txt"}.issubset(set(nm)):
+                  print("MISSING",m.name,list(nm)[:20]); continue
+              meta_txt=decode(nested.extractfile(nm["metadata.txt"]).read())
+              sig_txt=decode(nested.extractfile(nm["signature.txt"]).read())
+              if mi<3:
+                  print("META_SAMPLE",m.name,meta_txt[:8000])
+                  print("SIG_SAMPLE",m.name,sig_txt[:8000])
+              # metadata files may be key-value transposed or table-shaped.
+              meta=read_table_text(meta_txt)
+              sig=read_table_text(sig_txt)
+              recs.append({"archive":m.name,"meta_df":meta,"sig_df":sig,"meta_text":meta_txt})
+          print("PARSED_ARCHIVES",len(recs))
+
+          # Determine metadata schema by printing first several.
+          for r in recs[:5]:
+              print("META_COLS",r["archive"],list(r["meta_df"].columns),r["meta_df"].head(5).to_dict("records"))
+              print("SIG_COLS",r["archive"],list(r["sig_df"].columns),r["sig_df"].head(5).to_dict("records"))
+
+          # Extract regimen/drug name robustly from metadata raw text.
+          def kv_from_text(txt):
+              out={}
+              for line in txt.splitlines():
+                  parts=line.split("\t")
+                  if len(parts)>=2:
+                      out[parts[0].strip()]="\t".join(parts[1:]).strip()
+              return out
+
+          def value_from_meta(r,keys):
+              df=r["meta_df"]
+              # key-value two-column
+              if df.shape[1]>=2:
+                  for _,row in df.iterrows():
+                      k=str(row.iloc[0]).strip().lower()
+                      for key in keys:
+                          if key.lower() in k:
+                              return str(row.iloc[1]).strip()
+              # column-shaped
+              for c in df.columns:
+                  for key in keys:
+                      if key.lower() in str(c).lower() and len(df):
+                          v=df.iloc[0][c]
+                          if pd.notna(v): return str(v).strip()
+              txt=r["meta_text"]
+              for line in txt.splitlines():
+                  lo=line.lower()
+                  for key in keys:
+                      if key.lower() in lo:
+                          parts=line.split("\t")
+                          if len(parts)>=2:return parts[-1].strip()
+              return ""
+
+          # Signature parser: infer gene symbol + logFC/score and produce top up/down sets.
+          def sig_sets(df):
+              cols=[str(c) for c in df.columns]
+              gene_col=next((c for c in cols if re.search(r'gene.?symbol|symbol|gene$',c,re.I)),None)
+              if not gene_col:
+                  gene_col=next((c for c in cols if re.search(r'gene',c,re.I)),None)
+              score_col=next((c for c in cols if re.search(r'log2?fc|logfc|fold.?change|estimate|score',c,re.I)),None)
+              if not gene_col or not score_col:
+                  return None,None,{"gene_col":gene_col,"score_col":score_col,"cols":cols}
+              z=df[[gene_col,score_col]].copy()
+              z.columns=["gene","score"]
+              z["gene"]=z.gene.astype(str).str.strip()
+              z["score"]=pd.to_numeric(z.score,errors="coerce")
+              z=z.dropna().drop_duplicates("gene")
+              z=z[z.gene.str.match(r'^[A-Za-z0-9_.-]+$')]
+              up=z[z.score>0].nlargest(150,"score").gene.tolist()
+              dn=z[z.score<0].nsmallest(150,"score").gene.tolist()
+              return up,dn,{"gene_col":gene_col,"score_col":score_col,"n":len(z),"n_up":len(up),"n_dn":len(dn)}
+
+          candidates=[]
+          combo_re=re.compile(r'\s(?:\+|/|and|plus)\s|\bcombined?\b|\bcombination\b',re.I)
+          for r in recs:
+              regimen=value_from_meta(r,["Therapeutic regimen","Drug name","Drug"])
+              cancer=value_from_meta(r,["Cancer subtype","Cancer type"])
+              up,dn,info=sig_sets(r["sig_df"])
+              if not regimen or combo_re.search(regimen) or not up or not dn:
+                  continue
+              candidates.append({"archive":r["archive"],"drug":regimen.strip(),"cancer":cancer,
+                                 "up":up,"down":dn,"sig_info":info})
+          print("SINGLE_AGENT_CANDIDATES",len(candidates))
+          print("SINGLE_AGENT_NAMES",json.dumps(sorted(set(x["drug"] for x in candidates)),ensure_ascii=False))
+
+          # L1000FWD API helpers.
+          def lget(path):
+              return get(L1000+path).json()
+          def lpost(path,payload):
+              err=None
+              for a in range(5):
+                  try:
+                      rr=S.post(L1000+path,json=payload,timeout=180)
+                      print("LPOST",path,rr.status_code,len(rr.content))
+                      if rr.status_code<500:
+                          rr.raise_for_status(); return rr.json()
+                      err=RuntimeError(rr.text[:500])
+                  except Exception as e:err=e
+                  time.sleep(2*(a+1))
+              raise err
+
+          def norm(s):return re.sub(r'[^a-z0-9]','',str(s).lower())
+          synonym_cache={}
+          def search_drug(name):
+              if name in synonym_cache:return synonym_cache[name]
+              try:
+                  q=lget("/synonyms/"+requests.utils.quote(name,safe=""))
+              except Exception as e:
+                  print("SYN_ERR",name,repr(e));q=[]
+              synonym_cache[name]=q
+              print("SYN",name,json.dumps(q,ensure_ascii=False)[:4000])
+              return q
+
+          # First establish how many CDS drugs can map to L1000.
+          mapped=[]
+          for x in candidates:
+              q=search_drug(x["drug"])
+              if q:
+                  mapped.append((x,q))
+          print("L1000_MAPPABLE_COHORTS",len(mapped),"OF",len(candidates),
+                "UNIQUE_DRUGS",len(set(x["drug"] for x,_ in mapped)))
+
+          # Pilot: at most 40 cohort-level single-agent signatures, deterministic alphabetical.
+          mapped=sorted(mapped,key=lambda z:(z[0]["drug"].lower(),z[0]["archive"]))[:40]
+          results=[]
+          for ii,(x,syns) in enumerate(mapped):
+              try:
+                  # names/ids returned by synonym endpoint identify canonical L1000 drugs.
+                  target_names=set()
+                  target_ids=set()
+                  for d in syns:
+                      if isinstance(d,dict):
+                          for k in ["pert_iname","name","drug_name","pert_desc"]:
+                              if d.get(k):target_names.add(norm(d[k]))
+                          for k in ["pert_id","id"]:
+                              if d.get(k):target_ids.add(str(d[k]))
+                  sr=lpost("/sig_search",{"up_genes":x["up"],"down_genes":x["down"]})
+                  rid=sr.get("result_id") or sr.get("id") or sr.get("result") if isinstance(sr,dict) else sr
+                  if isinstance(rid,dict): rid=rid.get("id") or rid.get("result_id")
+                  if not rid:
+                      print("NO_RID",x["drug"],sr);continue
+                  topn=lget("/result/topn/"+str(rid))
+                  # Flatten result lists from API response.
+                  hits=[]
+                  if isinstance(topn,list):hits=topn
+                  elif isinstance(topn,dict):
+                      for k,v in topn.items():
+                          if isinstance(v,list):
+                              hits += [h for h in v if isinstance(h,dict)]
+                  same=[]
+                  for rank,h in enumerate(hits,1):
+                      vals=[h.get(k) for k in ["pert_iname","name","drug_name","pert_desc"] if h.get(k)]
+                      ids=[str(h.get(k)) for k in ["pert_id","id"] if h.get(k)]
+                      if any(norm(v) in target_names for v in vals) or any(v in target_ids for v in ids):
+                          same.append(rank)
+                  rec={"archive":x["archive"],"drug":x["drug"],"cancer":x["cancer"],
+                       "n_up":len(x["up"]),"n_down":len(x["down"]),
+                       "n_hits_returned":len(hits),"same_drug_ranks":same,
+                       "same_drug_top50":bool(same),"best_rank":min(same) if same else None}
+                  results.append(rec)
+                  print("PILOT_REC",json.dumps(rec,ensure_ascii=False))
+              except Exception as e:
+                  print("PILOT_ERR",x["drug"],x["archive"],repr(e))
+
+          (OUT/"pilot_results.json").write_text(json.dumps(results,indent=2,ensure_ascii=False),encoding="utf-8")
+          n=len(results); hit=sum(r["same_drug_top50"] for r in results)
+          print("=== O04_SELF_RECOVERY_SUMMARY ===")
+          print(json.dumps({"n_tested":n,"top50_self_recovered":hit,
+                            "self_recovery_rate":hit/n if n else None,
+                            "median_best_rank":float(np.median([r["best_rank"] for r in results if r["best_rank"] is not None])) if hit else None,
+                            "unique_drugs":len(set(r["drug"] for r in results))},indent=2))
+          PY
+          python /tmp/o04.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o04-cdsdb-l1000-pilot
+          path: o04_pilot/
+          retention-days: 5
