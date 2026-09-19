@@ -27,42 +27,14 @@ def download(url,path):
 
 def map_genes(ids):
     ids=[str(x) for x in ids]
-    # direct symbol hits first
+    # GSE114988 row identifiers are gene symbols suffixed by chromosome, e.g. Id1__chr2.
     out={}
-    upper={x.upper():x for x in ids}
-    for g in BMP_GENES:
-        if g.upper() in upper:
-            out[upper[g.upper()]]=g
-    unresolved=[x for x in ids if x not in out]
-    if not unresolved:
-        return out,{"mode":"direct_symbol","mapped":len(out)}
-
-    # infer namespace
-    probe=unresolved[:100]
-    ens_frac=sum(x.upper().split(".")[0].startswith("ENSMUSG") for x in probe)/max(1,len(probe))
-    num_frac=sum(re.fullmatch(r"\d+",x) is not None for x in probe)/max(1,len(probe))
-    mg=mygene.MyGeneInfo()
-    if ens_frac>0.5:
-        clean=[x.split(".")[0] for x in unresolved]
-        q=mg.querymany(clean,scopes="ensembl.gene",fields="symbol",species="mouse",as_dataframe=False,returnall=False,verbose=False)
-        for src,res in zip(unresolved,q):
-            sym=res.get("symbol") if isinstance(res,dict) else None
-            if sym: out[src]=str(sym)
-        mode="ensembl.gene"
-    elif num_frac>0.5:
-        q=mg.querymany(unresolved,scopes="entrezgene",fields="symbol",species="mouse",as_dataframe=False,returnall=False,verbose=False)
-        for src,res in zip(unresolved,q):
-            sym=res.get("symbol") if isinstance(res,dict) else None
-            if sym: out[src]=str(sym)
-        mode="entrezgene"
-    else:
-        # generic exact query as last resort
-        q=mg.querymany(unresolved,scopes="symbol,ensembl.gene,entrezgene",fields="symbol",species="mouse",as_dataframe=False,returnall=False,verbose=False)
-        for src,res in zip(unresolved,q):
-            sym=res.get("symbol") if isinstance(res,dict) else None
-            if sym: out[src]=str(sym)
-        mode="generic"
-    return out,{"mode":mode,"mapped":len(out),"total":len(ids)}
+    bmp_upper={g.upper():g for g in BMP_GENES}
+    for raw in ids:
+        base=re.sub(r"__chr(?:[0-9]+|X|Y|M)$","",raw,flags=re.I)
+        if base.upper() in bmp_upper:
+            out[raw]=bmp_upper[base.upper()]
+    return out,{"mode":"strip___chr_suffix_to_symbol","mapped":len(out),"total":len(ids)}
 
 rawtar=download(GEO_BASE+"GSE114988_RAW.tar",ROOT/"GSE114988_RAW.tar")
 bcfile=download(GEO_BASE+"GSE114988_Cellseq2barcodes.csv.gz",ROOT/"GSE114988_Cellseq2barcodes.csv.gz")
