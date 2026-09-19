@@ -1,0 +1,32 @@
+name: O05 schema details
+
+on:
+  push:
+    branches: [o05-kinase-clinical-concordance-20260919]
+
+jobs:
+  details:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install pandas openpyxl requests
+      - shell: bash
+        run: |
+          python - <<'PY'
+          import io,json,re,requests,pandas as pd
+          H={"User-Agent":"Mozilla/5.0"}
+          u="https://static-content.springer.com/esm/art%3A10.1038%2Fs41587-026-03090-8/MediaObjects/41587_2026_3090_MOESM4_ESM.xlsx"
+          b=requests.get(u,headers=H,timeout=240).content
+          for sh in ["Table S1","Table S11","Table S12","Table S13"]:
+              raw=pd.read_excel(io.BytesIO(b),sheet_name=sh,header=None,nrows=14)
+              print("RAW",sh,raw.to_json(orient="split",default_handler=str)[:30000])
+          q='''query Q { __type(name:"Query") { fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } type { kind name ofType { kind name } } } } }'''
+          r=requests.post("https://civicdb.org/api/graphql",json={"query":q},headers=H,timeout=120)
+          print("QUERY_SCHEMA",r.status_code,r.text[:40000])
+          for typ in ["EvidenceItemConnection","MolecularProfile","Variant","Therapy","Disease"]:
+              qq='''query T($n:String!){ __type(name:$n){ fields { name args { name type { kind name ofType { kind name } } } type { kind name ofType { kind name ofType {kind name} } } } } }'''
+              rr=requests.post("https://civicdb.org/api/graphql",json={"query":qq,"variables":{"n":typ}},headers=H,timeout=120)
+              print("TYPE",typ,rr.status_code,rr.text[:30000])
+          PY
