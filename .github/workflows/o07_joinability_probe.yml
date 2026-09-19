@@ -1,0 +1,86 @@
+name: O07 joinability probe
+
+on:
+  push:
+    branches:
+      - o07-perturbseq-trial-failure-20260919
+
+jobs:
+  join_probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas pyarrow numpy
+      - name: Inspect IGNITE and Open Targets clinical evidence
+        shell: bash
+        run: |
+          python - <<'PY'
+          import requests,re,json,io
+          import pandas as pd, numpy as np
+          H={"User-Agent":"o07-perturbseq-trial-failure/0.1"}
+
+          # IGNITE target data
+          u="https://ignite.eecs.umich.edu/target-data.js"
+          r=requests.get(u,headers=H,timeout=300); print("IGNITE_HTTP",r.status_code,len(r.content)); r.raise_for_status()
+          t=r.text.strip()
+          pref="window.__TARGETS__ = "
+          assert t.startswith(pref)
+          raw=t[len(pref):].strip()
+          if raw.endswith(";"): raw=raw[:-1]
+          targets=json.loads(raw)
+          ig=pd.DataFrame(targets)
+          print("IGNITE_SHAPE",ig.shape)
+          print("IGNITE_COLS",json.dumps(ig.columns.tolist()))
+          print("IGNITE_STATUS_COUNTS",ig["drug_status"].value_counts(dropna=False).to_dict())
+          print("IGNITE_STAGE_COUNTS",ig["furthest_stage"].value_counts(dropna=False).head(20).to_dict())
+          print("IGNITE_ENSEMBL_NONNULL",int((ig.ensembl.astype(str)!="").sum()))
+
+          # HF repo tree
+          api="https://huggingface.co/api/datasets/opentargets/clinical_evidence/tree/main?recursive=true&expand=false"
+          rr=requests.get(api,headers=H,timeout=180); print("HF_API",rr.status_code,len(rr.content)); rr.raise_for_status()
+          arr=rr.json()
+          files=[x for x in arr if x.get("type")=="file"]
+          print("HF_FILES",json.dumps([{"path":x.get("path"),"size":x.get("size")} for x in files],indent=2)[:30000])
+          parq=[x for x in files if str(x.get("path","")).endswith(".parquet")]
+          print("PARQUET_N",len(parq))
+          if not parq: raise RuntimeError("No parquet files")
+          # Load first parquet, and all if modest
+          dfs=[]
+          totalbytes=sum((x.get("size") or 0) for x in parq)
+          print("PARQUET_TOTAL_BYTES",totalbytes)
+          for x in parq:
+              path=x["path"]
+              url="https://huggingface.co/datasets/opentargets/clinical_evidence/resolve/main/"+path
+              z=requests.get(url,headers=H,timeout=300,allow_redirects=True)
+              print("PARQ_GET",path,z.status_code,len(z.content),z.headers.get("content-type"))
+              z.raise_for_status()
+              df=pd.read_parquet(io.BytesIO(z.content))
+              print("PARQ",path,"SHAPE",df.shape)
+              print("COLS",json.dumps(df.columns.tolist()))
+              print("HEAD",df.head(3).to_json(orient="records",default_handler=str)[:15000])
+              dfs.append(df)
+              # Don't risk memory if many shards
+              if sum(len(d) for d in dfs)>1000000: break
+          d=pd.concat(dfs,ignore_index=True)
+          print("LOADED_ROWS",len(d))
+          # Common identifiers / reasons
+          for col in d.columns:
+              lc=col.lower()
+              if any(k in lc for k in ["reason","meta","therapeut","target","disease","status","phase","nct"]):
+                  try:
+                      print("VAL",col,d[col].astype(str).value_counts(dropna=False).head(30).to_dict())
+                  except Exception as e: print("VALERR",col,repr(e))
+          # direct ensembl join potential
+          if "targetId" in d.columns:
+              ens=set(ig.ensembl.dropna().astype(str))-{""}
+              dd=d[d.targetId.astype(str).isin(ens)]
+              print("ENSEMBL_MATCH_ROWS",len(dd),"UNIQUE_TARGETS",dd.targetId.nunique())
+              if "reason" in dd.columns:
+                  print("MATCH_REASON",dd.reason.astype(str).value_counts().head(30).to_dict())
+              if "metareason" in dd.columns:
+                  print("MATCH_METAREASON",dd.metareason.astype(str).value_counts().head(30).to_dict())
+          PY
