@@ -1,0 +1,229 @@
+name: O04 paired patient L1000 concordance
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  paired_pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy scipy
+      - name: Run locked paired responder pilot
+        shell: bash
+        run: |
+          mkdir -p o04_paired
+          cat > /tmp/o04_paired.py <<'PY'
+          import requests,pandas as pd,numpy as np,re,json,time,io,hashlib
+          from pathlib import Path
+          from scipy.stats import wilcoxon, binomtest
+
+          OUT=Path("o04_paired"); OUT.mkdir(exist_ok=True)
+          CDS="http://cdsdb.ncpsb.org.cn"
+          L1="https://maayanlab.cloud/L1000FWD"
+          S=requests.Session()
+          S.headers.update({"User-Agent":"o04-cdsdb-l1000/0.1 (+https://github.com/ByungwoongYoo/target-stability)"})
+
+          def norm(x): return re.sub(r'[^a-z0-9]','',str(x).lower())
+
+          def req(method,url,**kw):
+              err=None
+              for a in range(5):
+                  try:
+                      r=S.request(method,url,timeout=180,**kw)
+                      print("HTTP",method,url,r.status_code,len(r.content))
+                      if r.status_code < 500:
+                          r.raise_for_status(); return r
+                      err=RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+                  except Exception as e:
+                      err=e; print("HTTP_ERR",repr(e))
+                  time.sleep(2*(a+1))
+              raise err
+
+          # Full 181 dataset metadata. This JSON API is stable even though archive download endpoint is 502.
+          meta=req("POST",CDS+"/cdsdb/browse/dataset",
+                   headers={"Referer":CDS+"/browse/dataset","Content-Type":"application/json","Accept":"application/json"},
+                   json={"skip":0,"limit":500,"page":1,"filter":{},"sort":{}}).json()
+          rows=meta["data"]
+          print("CDS_TOTAL",meta.get("total"),"ROWS",len(rows))
+
+          byid={str(r.get("CDS-DB dataset ID")):r for r in rows}
+          # Strict paired-response candidates: exact single drug, explicit opposite response dataset.
+          pairs=[]
+          seen=set()
+          for r in rows:
+              rid=str(r.get("CDS-DB dataset ID",""))
+              rg=str(r.get("Response group","")).strip().lower()
+              opp=str(r.get("CDS-DB dataset with the opposite response group","")).strip()
+              drugs=r.get("drugNames") or []
+              if rg not in {"response","non-response"} or not opp or len(drugs)!=1 or opp not in byid:
+                  continue
+              o=byid[opp]; od=o.get("drugNames") or []
+              if len(od)!=1 or norm(drugs[0])!=norm(od[0]): continue
+              org=str(o.get("Response group","")).strip().lower()
+              if {rg,org}!={"response","non-response"}: continue
+              key=tuple(sorted([rid,opp]))
+              if key in seen: continue
+              seen.add(key)
+              rr=r if rg=="response" else o
+              nn=o if rg=="response" else r
+              # same source/cancer/regimen required for paired primary.
+              checks=[
+                  ("Source dataset",rr.get("Source dataset"),nn.get("Source dataset")),
+                  ("Therapeutic regimen",rr.get("Therapeutic regimen"),nn.get("Therapeutic regimen")),
+                  ("Cancer subtype",rr.get("Cancer subtype"),nn.get("Cancer subtype")),
+              ]
+              if any(norm(a)!=norm(b) for _,a,b in checks): continue
+              pairs.append({"drug":str(drugs[0]),"response_id":str(rr["CDS-DB dataset ID"]),
+                            "nonresponse_id":str(nn["CDS-DB dataset ID"]),
+                            "source":str(rr.get("Source dataset","")),
+                            "cancer":str(rr.get("Cancer subtype","")),
+                            "sampling_time_response":str(rr.get("Sampling time","")),
+                            "sampling_time_nonresponse":str(nn.get("Sampling time","")),
+                            "response_n":rr.get("Patient size"),"nonresponse_n":nn.get("Patient size")})
+          print("STRICT_RESPONSE_PAIRS_RAW",len(pairs))
+          print("PAIR_META",json.dumps(pairs,indent=2,ensure_ascii=False)[:30000])
+
+          # Exact L1000 name mapping. Require exact normalized synonym name.
+          mapcache={}
+          def map_drug(name):
+              if name in mapcache:return mapcache[name]
+              q=name.replace(" ","-").upper()
+              try:
+                  arr=req("GET",L1+"/synonyms/"+requests.utils.quote(q,safe="")).json()
+              except Exception as e:
+                  print("SYN_FAIL",name,repr(e)); arr=[]
+              exact=[x for x in arr if norm(x.get("Name",""))==norm(name)]
+              ids=sorted(set(str(x.get("pert_id")) for x in exact if x.get("pert_id")))
+              mapcache[name]=ids
+              print("SYN_MAP",name,ids,json.dumps(arr[:20],ensure_ascii=False))
+              return ids
+
+          # Fixed CDS-DB UI thresholds used before looking at outcomes.
+          def patient_deg(did):
+              obj=req("POST",CDS+"/cdsdb/analysisResults",
+                      headers={"Referer":CDS+f"/analysisResult?level=raw/dataset&jobId={did}",
+                               "Content-Type":"application/json","Accept":"application/json"},
+                      json={"jobId":did,"level":"raw/dataset","logFC":0.6,"pValue":0.1}).json()
+              tab=((obj.get("results") or {}).get("deg") or {}).get("tableData") or []
+              z=pd.DataFrame(tab)
+              if z.empty:return [],[],0
+              if "Gene symbol" not in z or "LogFC" not in z:return [],[],0
+              z["score"]=pd.to_numeric(z["LogFC"],errors="coerce")
+              z=z.dropna(subset=["score","Gene symbol"]).copy()
+              z["gene"]=z["Gene symbol"].astype(str).str.strip()
+              # Resolve aliases appearing as duplicate Gene IDs by retaining symbol rows but deduplicate symbol.
+              z=z.drop_duplicates("gene")
+              up=z[z.score>0].sort_values("score",ascending=False).head(150).gene.tolist()
+              dn=z[z.score<0].sort_values("score",ascending=True).head(150).gene.tolist()
+              return up,dn,len(z)
+
+          def l1000_scores(up,dn,target_ids):
+              # Require enough genes to make signature query meaningful.
+              if len(up)<10 or len(dn)<10:
+                  return None
+              sr=req("POST",L1+"/sig_search",json={"up_genes":up,"down_genes":dn}).json()
+              rid=sr.get("result_id")
+              if not rid:return None
+              csv=req("GET",L1+"/result/download/"+str(rid)).text
+              df=pd.read_csv(io.StringIO(csv))
+              # First unnamed column is sig_id in the published API.
+              if "pert_id" not in df.columns or "similarity_scores" not in df.columns:
+                  print("L1_COLS",list(df.columns)); return None
+              df["pert_id"]=df.pert_id.astype(str)
+              df["similarity_scores"]=pd.to_numeric(df.similarity_scores,errors="coerce")
+              target=df[df.pert_id.isin(set(target_ids))].dropna(subset=["similarity_scores"]).copy()
+              if target.empty:return {"result_id":rid,"n_all":len(df),"n_target":0}
+              vals=target.similarity_scores.to_numpy(float)
+              # descending rank of the target's best signature among all L1000 signatures
+              full=df.dropna(subset=["similarity_scores"]).sort_values("similarity_scores",ascending=False).reset_index(drop=True)
+              hitidx=np.where(full.pert_id.isin(set(target_ids)))[0]
+              best_rank=int(hitidx.min()+1) if len(hitidx) else None
+              return {"result_id":rid,"n_all":int(len(full)),"n_target":int(len(target)),
+                      "median_score":float(np.median(vals)),
+                      "mean_score":float(np.mean(vals)),
+                      "max_score":float(np.max(vals)),
+                      "q90_score":float(np.quantile(vals,.90)),
+                      "best_rank":best_rank,
+                      "best_rank_fraction":float(best_rank/len(full)) if best_rank else None}
+
+          tested=[]
+          # To limit API load in pilot: all strict pairs that map exactly, up to 20 pairs, deterministic by drug/source.
+          eligible=[]
+          for p in sorted(pairs,key=lambda x:(x["drug"].lower(),x["source"],x["response_id"])):
+              ids=map_drug(p["drug"])
+              if ids: eligible.append((p,ids))
+          print("L1000_MAPPABLE_STRICT_PAIRS",len(eligible))
+          eligible=eligible[:20]
+
+          for idx,(p,ids) in enumerate(eligible):
+              rec=dict(p); rec["l1000_pert_ids"]=ids
+              ok=True
+              for label,did in [("response",p["response_id"]),("nonresponse",p["nonresponse_id"])]:
+                  try:
+                      up,dn,ndeg=patient_deg(did)
+                      print("DEG",label,did,"N",ndeg,"UP",len(up),"DOWN",len(dn))
+                      sc=l1000_scores(up,dn,ids)
+                      rec[label]={"n_deg":ndeg,"n_up":len(up),"n_down":len(dn),"scores":sc}
+                      if not sc or sc.get("n_target",0)==0: ok=False
+                  except Exception as e:
+                      rec[label]={"error":repr(e)}; ok=False
+                      print("PAIR_SIDE_ERR",label,did,repr(e))
+              rec["complete"]=ok
+              if ok:
+                  rs=rec["response"]["scores"]; ns=rec["nonresponse"]["scores"]
+                  rec["delta_median_score_R_minus_NR"]=rs["median_score"]-ns["median_score"]
+                  rec["delta_max_score_R_minus_NR"]=rs["max_score"]-ns["max_score"]
+                  rec["delta_q90_score_R_minus_NR"]=rs["q90_score"]-ns["q90_score"]
+                  rec["rank_improvement_NR_minus_R"]=ns["best_rank_fraction"]-rs["best_rank_fraction"]
+              tested.append(rec)
+              print("PAIR_RESULT",json.dumps(rec,ensure_ascii=False)[:12000])
+
+          complete=[x for x in tested if x.get("complete")]
+          dmed=np.array([x["delta_median_score_R_minus_NR"] for x in complete],float)
+          dmax=np.array([x["delta_max_score_R_minus_NR"] for x in complete],float)
+          dq90=np.array([x["delta_q90_score_R_minus_NR"] for x in complete],float)
+          drank=np.array([x["rank_improvement_NR_minus_R"] for x in complete],float)
+
+          def stats(a):
+              if len(a)==0:return {"n":0}
+              pos=int((a>0).sum()); neg=int((a<0).sum())
+              out={"n":int(len(a)),"median":float(np.median(a)),"mean":float(np.mean(a)),
+                   "positive":pos,"negative":neg,"zero":int((a==0).sum())}
+              if pos+neg:
+                  out["sign_test_p"]=float(binomtest(pos,pos+neg,.5,alternative="two-sided").pvalue)
+              if len(a)>=2 and np.any(a!=0):
+                  try:
+                      w=wilcoxon(a,alternative="two-sided",zero_method="wilcox")
+                      out["wilcoxon_stat"]=float(w.statistic); out["wilcoxon_p"]=float(w.pvalue)
+                  except Exception as e: out["wilcoxon_error"]=repr(e)
+              return out
+
+          summary={
+              "strict_pairs_metadata":len(pairs),
+              "l1000_mappable_pairs":len(eligible),
+              "complete_pairs":len(complete),
+              "PRIMARY_delta_median_similarity_response_minus_nonresponse":stats(dmed),
+              "SECONDARY_delta_q90_similarity":stats(dq90),
+              "SECONDARY_delta_max_similarity":stats(dmax),
+              "SECONDARY_rank_improvement_response":stats(drank),
+          }
+          print("=== O04_PAIRED_RESULT ===")
+          print(json.dumps(summary,indent=2))
+          (OUT/"summary.json").write_text(json.dumps(summary,indent=2),encoding="utf-8")
+          (OUT/"pairs.json").write_text(json.dumps(tested,indent=2,ensure_ascii=False),encoding="utf-8")
+          (OUT/"metadata_pairs.json").write_text(json.dumps(pairs,indent=2,ensure_ascii=False),encoding="utf-8")
+          PY
+          python /tmp/o04_paired.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o04-paired-patient-l1000
+          path: o04_paired/
+          retention-days: 5
