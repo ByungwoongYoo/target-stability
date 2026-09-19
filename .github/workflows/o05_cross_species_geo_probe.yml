@@ -1,0 +1,52 @@
+name: O05 cross-species GEO structure probe
+
+on:
+  push:
+    branches:
+      - o05-cross-species-proteome-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy
+      - name: Probe GEO and clinical evidence
+        shell: bash
+        run: |
+          python - <<'PY'
+          import requests,gzip,io,re,json,pandas as pd
+          H={"User-Agent":"o05-cross-species/0.1"}
+          for gse in ["GSE325522","GSE325523","GSE325525"]:
+              prefix=gse[:6]+"nnn"
+              u=f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
+              r=requests.get(u,headers=H,timeout=240)
+              print("GEO",gse,r.status_code,len(r.content),r.headers.get("content-type"),u)
+              if r.status_code!=200: continue
+              txt=gzip.decompress(r.content).decode("utf-8","replace")
+              lines=txt.splitlines()
+              print("LINES",len(lines))
+              for key in ["!Sample_title","!Sample_geo_accession","!Sample_organism_ch1","!Sample_characteristics_ch1","!Sample_source_name_ch1","!series_matrix_table_begin"]:
+                  hit=[x for x in lines if x.startswith(key)]
+                  print("META",gse,key,hit[0][:10000] if hit else "NONE")
+              try:
+                  bi=lines.index("!series_matrix_table_begin")+1
+                  ei=lines.index("!series_matrix_table_end")
+                  tab="\n".join(lines[bi:ei])
+                  df=pd.read_csv(io.StringIO(tab),sep="\t",nrows=8)
+                  print("TABLE",gse,"COLS",len(df.columns),"HEADCOLS",json.dumps(list(df.columns[:15])))
+                  print("ROWS",df.head(8).to_json(orient="records")[:12000])
+              except Exception as e: print("TABLE_ERR",gse,repr(e))
+
+          u="https://huggingface.co/datasets/opentargets/clinical_evidence/resolve/main/clinical_evidence.csv.gz"
+          r=requests.get(u,headers=H,timeout=240)
+          print("HF",r.status_code,len(r.content),r.url)
+          if r.status_code==200:
+              c=pd.read_csv(io.BytesIO(r.content),compression="gzip",nrows=10)
+              print("HF_COLS",json.dumps(list(c.columns)))
+              print("HF_HEAD",c.head(3).to_json(orient="records")[:12000])
+          PY
