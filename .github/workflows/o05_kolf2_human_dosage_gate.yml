@@ -32,7 +32,7 @@ jobs:
           FITNESS_URL="https://raw.githubusercontent.com/y-doctor/KOLF2.1J_Perturbation_Cell_Atlas/main/docs/data/mde/fitness.json"
           XLSX_URL="https://raw.githubusercontent.com/y-doctor/KOLF2.1J_Perturbation_Cell_Atlas/main/psp/notebooks/input_files/D6-D14-Fitness-Z-Scores.xlsx"
           DEPMAP_URL="https://raw.githubusercontent.com/y-doctor/KOLF2.1J_Perturbation_Cell_Atlas/main/psp/notebooks/input_files/DepmapVSKOLF2-2025.csv"
-          GNOMAD_URL="https://storage.googleapis.com/gnomad-public/release/2.1.1/constraint/gnomad.v2.1.1.lof_metrics.by_gene.txt.bgz"
+          GNOMAD_URL="https://storage.googleapis.com/gcp-public-data--gnomad/release/2.1.1/constraint/gnomad.v2.1.1.lof_metrics.by_gene.txt.bgz"
 
           def get(url,timeout=300):
               r=requests.get(url,headers=H,timeout=timeout)
