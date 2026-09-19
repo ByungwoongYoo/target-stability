@@ -1,0 +1,57 @@
+name: O04 patient API one-pair probe
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas
+      - name: Probe one strict pair
+        run: |
+          python - <<'PY'
+          import requests,json,re,pandas as pd
+          S=requests.Session(); S.headers.update({"User-Agent":"o04-patient-probe/0.1"})
+          B="http://cdsdb.ncpsb.org.cn"
+          def post(path,obj):
+              r=S.post(B+path,json=obj,headers={"Content-Type":"application/json","Accept":"application/json"},timeout=120)
+              print("POST",path,r.status_code,len(r.content))
+              print(r.text[:5000])
+              r.raise_for_status(); return r.json()
+
+          # Try patient browser
+          for path in ["/cdsdb/browse/patient","/cdsdb/browse/patientSignature"]:
+              try:
+                  o=post(path,{"skip":0,"limit":20,"page":1,"filter":{"CDS-DB dataset ID":"CDS_dataset_Microarray_116"},"sort":{}})
+                  print("PARSED",path,type(o),o.keys() if isinstance(o,dict) else None)
+                  if isinstance(o,dict) and o.get("data"):
+                      print("FIRST",json.dumps(o["data"][:5],ensure_ascii=False,indent=2)[:15000])
+              except Exception as e: print("ERR",path,repr(e))
+
+          # Pull dataset row and parse patient signature ids
+          o=post("/cdsdb/browse/dataset",{"skip":0,"limit":500,"page":1,"filter":{},"sort":{}})
+          row=[x for x in o.get("data",[]) if x.get("CDS-DB dataset ID")=="CDS_dataset_Microarray_116"][0]
+          print("DATASET_ROW",json.dumps(row,ensure_ascii=False,indent=2)[:20000])
+          ids=[]
+          for k,v in row.items():
+              if "patient" in str(k).lower() and "signature" in str(k).lower():
+                  print("PAT_FIELD",k,repr(v)[:10000])
+                  if isinstance(v,list): ids += [str(x) for x in v]
+                  elif isinstance(v,str): ids += re.findall(r'CDS_patient_signature_\d+',v)
+          ids=list(dict.fromkeys(ids))
+          print("IDS",ids[:20],"N",len(ids))
+          for pid in ids[:2]:
+              try:
+                  x=post("/cdsdb/analysisResults",{"jobId":pid,"level":"raw/patient","logFC":1e-9,"pValue":1.0})
+                  deg=((x.get("results") or {}).get("deg") or {}).get("tableData") or []
+                  print("PROFILE",pid,"N",len(deg),"HEAD",json.dumps(deg[:10],ensure_ascii=False)[:12000])
+              except Exception as e: print("PROFILE_ERR",pid,repr(e))
+          PY
