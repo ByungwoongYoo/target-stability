@@ -1,0 +1,231 @@
+name: O04 patient fast parallel gate
+
+on:
+  push:
+    branches:
+      - o04-patient-fast-parallel-20260919
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy scipy statsmodels
+      - name: Run parallel locked patient gate
+        shell: bash
+        run: |
+          mkdir -p o04_fast_parallel
+          cat > /tmp/o04_parallel.py <<'PY'
+          import requests,pandas as pd,numpy as np,re,json,io,time,gzip
+          from pathlib import Path
+          from scipy.stats import rankdata, binomtest, wilcoxon
+          import statsmodels.formula.api as smf
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          OUT=Path("o04_fast_parallel"); OUT.mkdir(exist_ok=True)
+          CDS="http://cdsdb.ncpsb.org.cn"
+          SIG="https://maayanlab.cloud/sigcom-lincs/metadata-api/signatures/find"
+          UA="o04-parallel-gate/0.1"
+          def norm(x): return re.sub(r'[^a-z0-9]','',str(x).lower())
+
+          def request(method,url,**kw):
+              last=None
+              for a in range(5):
+                  try:
+                      h=kw.pop("headers",{})
+                      h={**h,"User-Agent":UA}
+                      r=requests.request(method,url,headers=h,timeout=180,**kw)
+                      if r.status_code<500:
+                          r.raise_for_status(); return r
+                      last=RuntimeError(f"{r.status_code} {r.text[:180]}")
+                  except Exception as e:
+                      last=e
+                  time.sleep(1.5*(a+1))
+              raise last
+
+          meta=request("POST",CDS+"/cdsdb/browse/dataset",
+              headers={"Content-Type":"application/json","Accept":"application/json"},
+              json={"skip":0,"limit":500,"page":1,"filter":{},"sort":{}}).json()["data"]
+          byid={str(r.get("CDS-DB dataset ID")):r for r in meta}
+
+          raw=[]; seen=set()
+          for r in meta:
+              rid=str(r.get("CDS-DB dataset ID",""))
+              opp=str(r.get("CDS-DB dataset with the opposite response group","")).strip()
+              rg=str(r.get("Response group","")).strip().lower()
+              drugs=r.get("drugNames") or []
+              if rg not in {"response","non-response"} or not opp or opp not in byid or len(drugs)!=1: continue
+              o=byid[opp]; od=o.get("drugNames") or []
+              org=str(o.get("Response group","")).strip().lower()
+              if len(od)!=1 or norm(drugs[0])!=norm(od[0]) or {rg,org}!={"response","non-response"}: continue
+              key=tuple(sorted([rid,opp]))
+              if key in seen: continue
+              seen.add(key)
+              rr=r if rg=="response" else o; nn=o if rg=="response" else r
+              if any(norm(rr.get(k,""))!=norm(nn.get(k,"")) for k in ["Source dataset","Therapeutic regimen","Cancer subtype"]): continue
+              raw.append({
+                "drug":str(drugs[0]),"R_dataset":str(rr["CDS-DB dataset ID"]),"N_dataset":str(nn["CDS-DB dataset ID"]),
+                "source":str(rr.get("Source dataset","")),"cancer":str(rr.get("Cancer subtype","")),
+                "n_R":int(rr.get("Patient size") or 0),"n_N":int(nn.get("Patient size") or 0)
+              })
+          groups={}
+          for p in raw: groups.setdefault((p["source"],p["drug"]),[]).append(p)
+          chosen=[]
+          for _,arr in groups.items():
+              arr=sorted(arr,key=lambda x:(-(x["n_R"]+x["n_N"]),x["R_dataset"],x["N_dataset"]))
+              p=arr[0]
+              if p["n_R"]>=3 and p["n_N"]>=3: chosen.append(p)
+          chosen=sorted(chosen,key=lambda x:(x["drug"].lower(),x["source"]))
+          print("LOCKED",json.dumps({"raw_pairs":len(raw),"cohorts":len(chosen),"meta":chosen},ensure_ascii=False))
+
+          def patient_ids(ds):
+              v=byid[ds].get("CDS patient signature list") or ""
+              if isinstance(v,list): return list(dict.fromkeys(map(str,v)))
+              return list(dict.fromkeys(re.findall(r'CDS_patient_signature_\d+',str(v))))
+
+          # LINCS per drug: all actual chemical cell-context profiles among first 100 metadata matches.
+          def fetch_lincs_file(x):
+              m=x.get("meta",{}); u=m.get("persistent_id")
+              if str(m.get("pert_type","")).lower()!="chemical" or not m.get("cell_line") or not u: return None
+              try:
+                  b=request("GET",u).content
+                  if b[:2]==b"\x1f\x8b" or str(u).endswith(".gz"): b=gzip.decompress(b)
+                  d=pd.read_csv(io.BytesIO(b),sep="\t")
+                  if "symbol" not in d.columns or "CD-coefficient" not in d.columns: return None
+                  d["gene"]=d["symbol"].astype(str).str.upper().str.strip()
+                  d["coef"]=pd.to_numeric(d["CD-coefficient"],errors="coerce")
+                  d=d.dropna(subset=["gene","coef"]).copy()
+                  d["abs"]=d.coef.abs()
+                  d=d.sort_values("abs",ascending=False).drop_duplicates("gene")
+                  return {"id":x.get("id"),"cell":m.get("cell_line"),"gene":d.gene.to_numpy(), "coef":d.coef.to_numpy(float)}
+              except Exception as e:
+                  print("LINCS_ERR",m.get("pert_name"),m.get("cell_line"),repr(e)); return None
+
+          def lincs_drug(drug):
+              arr=request("POST",SIG,json={"filter":{"where":{"meta.pert_name":drug.lower()},"limit":100}}).json()
+              with ThreadPoolExecutor(max_workers=12) as ex:
+                  vals=list(ex.map(fetch_lincs_file,arr))
+              vals=[x for x in vals if x and len(x["gene"])>=1000]
+              print("LINCS",drug,len(vals))
+              return vals
+
+          unique_drugs=sorted({p["drug"] for p in chosen})
+          lincs={}
+          with ThreadPoolExecutor(max_workers=6) as ex:
+              fut={ex.submit(lincs_drug,d):d for d in unique_drugs}
+              for f in as_completed(fut):
+                  d=fut[f]
+                  try:lincs[d]=f.result()
+                  except Exception as e: print("LINCS_DRUG_ERR",d,repr(e)); lincs[d]=[]
+
+          eligible=[p for p in chosen if lincs.get(p["drug"])]
+          print("ELIGIBLE_COHORTS",len(eligible),json.dumps([(p["drug"],p["source"]) for p in eligible]))
+
+          # Fetch each patient once, full gene signature, in parallel.
+          needed=[]
+          pid_meta={}
+          for p in eligible:
+              for response,ds in [(1,p["R_dataset"]),(0,p["N_dataset"])]:
+                  for pid in patient_ids(ds):
+                      needed.append(pid); pid_meta[pid]=(p,response)
+          needed=list(dict.fromkeys(needed))
+          print("PATIENTS_NEEDED",len(needed))
+
+          def fetch_patient(pid):
+              try:
+                  obj=request("POST",CDS+"/cdsdb/analysisResults",
+                    headers={"Content-Type":"application/json","Accept":"application/json"},
+                    json={"jobId":pid,"level":"raw/patient","logFC":1e-9,"pValue":1.0}).json()
+                  tab=((obj.get("results") or {}).get("deg") or {}).get("tableData") or []
+                  d=pd.DataFrame(tab)
+                  if d.empty or "Gene symbol" not in d or "LogFC" not in d:return pid,None
+                  d["gene"]=d["Gene symbol"].astype(str).str.upper().str.strip()
+                  d["coef"]=pd.to_numeric(d["LogFC"],errors="coerce")
+                  d=d.dropna(subset=["gene","coef"]).copy()
+                  d["abs"]=d.coef.abs()
+                  d=d.sort_values("abs",ascending=False).drop_duplicates("gene")
+                  return pid,dict(zip(d.gene,d.coef.astype(float)))
+              except Exception as e:
+                  print("PAT_ERR",pid,repr(e)); return pid,None
+
+          patients={}
+          with ThreadPoolExecutor(max_workers=12) as ex:
+              for pid,prof in ex.map(fetch_patient,needed):
+                  if prof: patients[pid]=prof
+          print("PATIENTS_FETCHED",len(patients))
+
+          def fast_spearman(pdict,lprof):
+              lg=lprof["gene"]; lv=lprof["coef"]
+              # LINCS gene order, gather patient where present.
+              idx=[]; pv=[]
+              for i,g in enumerate(lg):
+                  v=pdict.get(g)
+                  if v is not None:
+                      idx.append(i); pv.append(v)
+              if len(idx)<500:return None
+              a=np.asarray(pv,float); b=lv[np.asarray(idx,int)]
+              # Pearson of ranks = Spearman.
+              ra=rankdata(a); rb=rankdata(b)
+              sa=ra.std(); sb=rb.std()
+              if sa==0 or sb==0:return None
+              return float(np.corrcoef(ra,rb)[0,1])
+
+          rows=[]
+          for pid,prof in patients.items():
+              p,response=pid_meta[pid]
+              vals=[fast_spearman(prof,lp) for lp in lincs[p["drug"]]]
+              vals=np.array([v for v in vals if v is not None and np.isfinite(v)],float)
+              if not len(vals):continue
+              rows.append({**p,"response":response,"patient_sig_id":pid,
+                           "n_lincs_profiles":int(len(vals)),
+                           "median_rho":float(np.median(vals)),
+                           "mean_rho":float(vals.mean()),
+                           "max_rho":float(vals.max()),
+                           "q90_rho":float(np.quantile(vals,.9))})
+          df=pd.DataFrame(rows)
+          print("ROWS_SCORED",len(df))
+          cohorts=[]
+          if not df.empty:
+              df["study"]=df["source"].astype(str)+"|"+df["drug"].astype(str)+"|"+df["cancer"].astype(str)
+              for study,g in df.groupby("study"):
+                  if g.response.nunique()!=2:continue
+                  R=g[g.response==1].median_rho.to_numpy(float); N=g[g.response==0].median_rho.to_numpy(float)
+                  cohorts.append({"study":study,"drug":str(g.drug.iloc[0]),"source":str(g.source.iloc[0]),
+                     "n_R":int(len(R)),"n_N":int(len(N)),"median_R":float(np.median(R)),"median_N":float(np.median(N)),
+                     "delta":float(np.median(R)-np.median(N))})
+              good=df.groupby("study").response.nunique()
+              d=df[df.study.isin(good[good==2].index)].copy()
+          else:d=df
+
+          out={"raw_pairs":len(raw),"locked_cohorts":len(chosen),"eligible_cohorts":len(eligible),
+               "patients_needed":len(needed),"patients_fetched":len(patients),"patients_scored":int(len(df)),
+               "complete_cohorts":len(cohorts),"cohorts":cohorts}
+          if len(d)>=10 and d.response.nunique()==2:
+              m=smf.ols("median_rho ~ response + C(study)",data=d).fit(cov_type="HC3")
+              out["primary"]={"n":int(len(d)),"studies":int(d.study.nunique()),"drugs":int(d.drug.nunique()),
+                 "beta_response":float(m.params["response"]),"CI95":[float(x) for x in m.conf_int().loc["response"]],
+                 "p":float(m.pvalues["response"])}
+          deltas=np.array([x["delta"] for x in cohorts],float)
+          if len(deltas):
+              pos=int((deltas>0).sum()); neg=int((deltas<0).sum())
+              out["cohort_summary"]={"n":int(len(deltas)),"median_delta":float(np.median(deltas)),
+                 "positive":pos,"negative":neg,"sign_p":float(binomtest(pos,pos+neg,.5).pvalue) if pos+neg else None}
+              if len(deltas)>=2:
+                  try:out["cohort_summary"]["wilcoxon_p"]=float(wilcoxon(deltas).pvalue)
+                  except Exception as e:out["cohort_summary"]["wilcoxon_error"]=repr(e)
+          print("=== O04_PARALLEL_RESULT ===")
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          (OUT/"result.json").write_text(json.dumps(out,ensure_ascii=False,indent=2))
+          df.to_csv(OUT/"patients.csv",index=False)
+          PY
+          python /tmp/o04_parallel.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o04-fast-parallel
+          path: o04_fast_parallel/
+          retention-days: 5
