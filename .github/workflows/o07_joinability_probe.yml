@@ -29,9 +29,10 @@ jobs:
           t=r.text.strip()
           pref="window.__TARGETS__ = "
           assert t.startswith(pref)
-          raw=t[len(pref):].strip()
-          if raw.endswith(";"): raw=raw[:-1]
-          targets=json.loads(raw)
+          raw=t[len(pref):].lstrip()
+          dec=json.JSONDecoder()
+          targets,end=dec.raw_decode(raw)
+          print("IGNITE_JSON_END",end,"TRAILER",raw[end:end+500])
           ig=pd.DataFrame(targets)
           print("IGNITE_SHAPE",ig.shape)
           print("IGNITE_COLS",json.dumps(ig.columns.tolist()))
