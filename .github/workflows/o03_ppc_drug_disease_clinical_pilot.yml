@@ -90,7 +90,7 @@ jobs:
               xcol=next((c for c in ["x_group","x_value","group_value","oncotree_code"] if c in d.columns),None)
               hcol=next((c for c in ["hue_group","hue_value","short_name"] if c in d.columns),None)
               vcol=next((c for c in ["aggregated_value","value","mean_value","agg_value","mean","z_score"] if c in d.columns),None)
-              ncol=next((c for c in ["count","sample_count","n","n_samples"] if c in d.columns),None)
+              ncol=next((c for c in ["sample_count","count","n_samples","n"] if c in d.columns),None)
               if not all([xcol,hcol,vcol]):
                   raise RuntimeError(f"Unknown aggregate schema {list(d.columns)}")
               out=d.rename(columns={xcol:"oncotree_code",hcol:"short_name",vcol:label})
@@ -112,7 +112,7 @@ jobs:
           print("FDA_COUNTS",bias.fda_approval.value_counts(dropna=False).to_dict())
 
           # pre-specified sample support tiers
-          results={"raw_pairs":len(bias),"tiers":{}}
+          results={"raw_pairs":len(bias),"primary_support_min_n":5,"sensitivity_support_min_n":[3,10],"tiers":{}}
           for min_n in [3,5,10]:
               x=bias[(bias.ex_z_n>=min_n)&(bias.cl_z_n>=min_n)&bias.fda_approval.notna()].copy()
               x["approved"]=x.fda_approval.eq("APPROVED")
