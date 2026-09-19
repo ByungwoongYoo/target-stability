@@ -1,0 +1,38 @@
+name: O04 single dataset download probe
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Probe
+        run: |
+          python - <<'PY'
+          import requests,io,tarfile,zipfile,json
+          H={"User-Agent":"Mozilla/5.0","Referer":"http://cdsdb.ncpsb.org.cn/analysisResult?level=raw/dataset&jobId=CDS_dataset_Microarray_116"}
+          for level in ["dataset","raw/dataset"]:
+              u=f"http://cdsdb.ncpsb.org.cn/apiFlask/downloadData?id=CDS_dataset_Microarray_116&level={level}"
+              r=requests.get(u,headers=H,timeout=180,allow_redirects=True)
+              print("URL",u,"STATUS",r.status_code,"BYTES",len(r.content),"CTYPE",r.headers.get("content-type"),"DISP",r.headers.get("content-disposition"),"HEAD",r.content[:12])
+              if r.status_code==200 and len(r.content)>100:
+                  try:
+                      z=zipfile.ZipFile(io.BytesIO(r.content)); print("ZIP",z.namelist()[:100])
+                      for n in z.namelist()[:20]:
+                          d=z.read(n)
+                          if len(d)<200000: print("MEM",n,len(d),d[:1000].decode("utf-8","replace"))
+                  except Exception as e: print("ZIPERR",repr(e))
+                  try:
+                      t=tarfile.open(fileobj=io.BytesIO(r.content),mode="r:*"); print("TAR",t.getnames()[:100])
+                      for m in t.getmembers()[:20]:
+                          if m.isfile() and m.size<200000:
+                              d=t.extractfile(m).read(); print("TMEM",m.name,len(d),d[:1000].decode("utf-8","replace"))
+                  except Exception as e: print("TARERR",repr(e))
+          PY
