@@ -1,0 +1,211 @@
+name: O07 cross-brain Nature gate
+
+on:
+  push:
+    branches:
+      - o07-gateway-brain-concordance-20260919
+
+jobs:
+  cross_brain_gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install cellxgene-census requests pandas numpy scipy statsmodels pyarrow
+      - name: Run locked Gateway-to-brain concordance screen
+        shell: bash
+        run: |
+          mkdir -p o07_crossbrain
+          cat > /tmp/o07_crossbrain.py <<'PY'
+          import io,json,requests,numpy as np,pandas as pd
+          from pathlib import Path
+          from scipy.stats import spearmanr, binomtest
+          import cellxgene_census
+
+          OUT=Path("o07_crossbrain")
+          H={"User-Agent":"o07-gateway-validation/0.1"}
+          SRC_URL="https://huggingface.co/datasets/yashvir/olfactory-regenerative-age-data/resolve/main/results/tables/pseudobulk_genomewide_limma_voom_matched_flex_v2_device.tsv.gz"
+          r=requests.get(SRC_URL,headers=H,timeout=240)
+          print("SOURCE_FILE",r.status_code,len(r.content),r.headers.get("content-type"))
+          r.raise_for_status()
+          src=pd.read_csv(io.BytesIO(r.content),sep="\t",compression="gzip")
+          print("SOURCE_SHAPE",src.shape)
+
+          OSN_STATES=[
+            "Early_mature_mOSN","Fully_mature_mOSN","Stressed_mOSN",
+            "Early_iOSN","Late_iOSN"
+          ]
+          TARGETS={
+            "AD":{
+              "contrast":"ad_vs_healthy",
+              "dataset_id":"c2876b1b-06d8-4d96-a56b-5304f815b99a",
+              "target_disease":"Alzheimer disease",
+              "label":"SEA-AD_MTG_whole_taxonomy"
+            },
+            "PD":{
+              "contrast":"pd_vs_healthy",
+              "dataset_id":"2856d06c-0ff9-4e01-bfc9-202b74d0b60f",
+              "target_disease":"Parkinson disease",
+              "label":"PD_dopamine_neuron_atlas"
+            }
+          }
+
+          def source_effect(contrast):
+              z=src[(src.contrast==contrast)&(src.fine_cell_type.isin(OSN_STATES))&(src.status=="ok")].copy()
+              z=z.dropna(subset=["gene_symbol","log2fc"])
+              # all tested genes, robust aggregation across prespecified OSN states
+              g=(z.groupby("gene_symbol")
+                   .agg(source_log2fc=("log2fc","median"),
+                        n_osn_states=("fine_cell_type","nunique"),
+                        source_min_fdr=("fdr","min"))
+                   .reset_index())
+              g=g[g.n_osn_states>=3].copy()
+              g["abs_source"]=g.source_log2fc.abs()
+              g=g.sort_values(["abs_source","gene_symbol"],ascending=[False,True]).reset_index(drop=True)
+              top=g.head(500).copy()
+              print("SOURCE",contrast,"GENES",len(g),"TOP500_EFFECT_RANGE",float(top.source_log2fc.min()),float(top.source_log2fc.max()))
+              print("SOURCE_TOP20",top.head(20).to_json(orient="records"))
+              return top
+
+          def parse_age(s):
+              import re
+              m=re.search(r"(\d+)-year-old",str(s))
+              return float(m.group(1)) if m else np.nan
+
+          def brain_effect(census, cfg, genes):
+              organism=census["census_data"]["homo_sapiens"]
+              cols=["soma_joinid","dataset_id","donor_id","disease","cell_type","sex","development_stage","is_primary_data"]
+              obs=organism.obs.read(
+                  value_filter=f'dataset_id == "{cfg["dataset_id"]}"',
+                  column_names=cols
+              ).concat().to_pandas()
+              print("BRAIN_OBS",cfg["label"],obs.shape)
+              print("BRAIN_DISEASE",cfg["label"],json.dumps(obs.disease.astype(str).value_counts().to_dict()))
+              print("BRAIN_CELLTYPE_TOP",cfg["label"],json.dumps(obs.cell_type.astype(str).value_counts().head(80).to_dict()))
+              print("BRAIN_DONORS",cfg["label"],obs.donor_id.nunique())
+
+              obs=obs[obs.is_primary_data.astype(bool)].copy() if "is_primary_data" in obs else obs.copy()
+              # Restrict to neuronal cells using standardized cell-type labels.
+              neuronal=obs.cell_type.astype(str).str.contains(
+                  r"neuron|neuronal|dopaminergic|glutamatergic|GABAergic",case=False,regex=True,na=False)
+              if neuronal.sum()>=500:
+                  obs=obs[neuronal].copy()
+              print("BRAIN_NEURON_OBS",cfg["label"],len(obs),"DONORS",obs.donor_id.nunique())
+              print("BRAIN_NEURON_DISEASE",cfg["label"],json.dumps(obs.disease.astype(str).value_counts().to_dict()))
+
+              dis=str(cfg["target_disease"])
+              keep=obs.disease.astype(str).isin([dis,"normal"])
+              obs=obs[keep].copy()
+              donor_meta=obs[["donor_id","disease","sex","development_stage"]].drop_duplicates()
+              print("BRAIN_CONTRAST_DONORS",cfg["label"],
+                    json.dumps(donor_meta.disease.astype(str).value_counts().to_dict()))
+              if donor_meta.disease.astype(str).eq(dis).sum()<3 or donor_meta.disease.astype(str).eq("normal").sum()<3:
+                  return {"status":"insufficient_donors"}
+
+              # all human var metadata is small; filter locally
+              var=organism.ms["RNA"].var.read(
+                  column_names=["soma_joinid","feature_name"]
+              ).concat().to_pandas()
+              gs=set(genes)
+              var=var[var.feature_name.astype(str).isin(gs)].drop_duplicates("feature_name").copy()
+              print("BRAIN_GENE_MAP",cfg["label"],len(var),"OF",len(gs))
+              if len(var)<100:
+                  return {"status":"insufficient_gene_map","n_gene_map":len(var)}
+
+              obs_ids=obs.soma_joinid.astype(np.int64).to_numpy()
+              var_ids=var.soma_joinid.astype(np.int64).to_numpy()
+              xread=organism.ms["RNA"].X["normalized"].read(coords=(obs_ids,var_ids))
+              xt=xread.tables().concat().to_pandas()
+              print("BRAIN_X_NNZ",cfg["label"],len(xt))
+              if xt.empty:
+                  return {"status":"empty_expression"}
+
+              # map cells and genes
+              om=obs[["soma_joinid","donor_id"]].drop_duplicates().set_index("soma_joinid").donor_id
+              vm=var.set_index("soma_joinid").feature_name
+              xt["donor_id"]=xt.soma_dim_0.map(om)
+              xt["gene_symbol"]=xt.soma_dim_1.map(vm)
+              xt=xt.dropna(subset=["donor_id","gene_symbol"])
+              # average normalized expression over all selected neuronal cells per donor,
+              # explicitly filling unobserved sparse entries as zero.
+              ncell=obs.groupby("donor_id").size().rename("n_cells")
+              sums=xt.groupby(["donor_id","gene_symbol"]).soma_data.sum().rename("sum_expr").reset_index()
+              donors=sorted(obs.donor_id.astype(str).unique())
+              genes2=sorted(var.feature_name.astype(str).unique())
+              mi=pd.MultiIndex.from_product([donors,genes2],names=["donor_id","gene_symbol"])
+              mat=(sums.set_index(["donor_id","gene_symbol"])
+                       .reindex(mi,fill_value=0).reset_index())
+              mat=mat.merge(ncell.reset_index(),on="donor_id",how="left")
+              mat["mean_norm"]=mat.sum_expr/mat.n_cells
+              mat["log_mean"]=np.log1p(mat.mean_norm)
+              dm=donor_meta.copy()
+              dm["donor_id"]=dm.donor_id.astype(str)
+              mat=mat.merge(dm,on="donor_id",how="left")
+
+              # donor-level disease-minus-normal mean effect for the fast gate.
+              eff=(mat.groupby(["gene_symbol","disease"]).log_mean.mean().unstack())
+              if dis not in eff or "normal" not in eff:
+                  return {"status":"missing_contrast"}
+              eff["brain_effect"]=eff[dis]-eff["normal"]
+              e=eff["brain_effect"].reset_index()
+              e.to_csv(OUT/f'{cfg["label"]}_brain_effect.tsv',sep="\t",index=False)
+              return {
+                  "status":"ok",
+                  "n_cells":int(len(obs)),
+                  "n_case_donors":int(dm.disease.astype(str).eq(dis).sum()),
+                  "n_control_donors":int(dm.disease.astype(str).eq("normal").sum()),
+                  "effect":e
+              }
+
+          def concord(src_top, brain, name):
+              if brain.get("status")!="ok":
+                  return {"status":brain.get("status"),"details":{k:v for k,v in brain.items() if k!="effect"}}
+              m=src_top[["gene_symbol","source_log2fc"]].merge(brain["effect"],on="gene_symbol",how="inner").dropna()
+              rho,p=spearmanr(m.source_log2fc,m.brain_effect)
+              signs=(np.sign(m.source_log2fc)==np.sign(m.brain_effect))
+              nz=(m.source_log2fc!=0)&(m.brain_effect!=0)
+              n=int(nz.sum()); same=int(signs[nz].sum())
+              sp=float(binomtest(same,n,.5).pvalue) if n else np.nan
+              rng=np.random.default_rng(17)
+              boots=[]
+              if len(m)>=20:
+                  for _ in range(1000):
+                      idx=rng.integers(0,len(m),len(m))
+                      rr=spearmanr(m.source_log2fc.to_numpy()[idx],m.brain_effect.to_numpy()[idx]).statistic
+                      if np.isfinite(rr): boots.append(rr)
+              ci=[float(np.quantile(boots,.025)),float(np.quantile(boots,.975))] if boots else [None,None]
+              out={
+                "status":"ok","n_genes":int(len(m)),
+                "source_brain_spearman":float(rho),"p":float(p),
+                "gene_bootstrap_ci95":ci,
+                "direction_same":same,"direction_n":n,
+                "direction_fraction":float(same/n) if n else None,
+                "direction_sign_test_p":sp,
+                "n_case_donors":brain["n_case_donors"],
+                "n_control_donors":brain["n_control_donors"],
+                "n_brain_cells":brain["n_cells"]
+              }
+              m.to_csv(OUT/f"{name}_aligned_genes.tsv",sep="\t",index=False)
+              print("CONCORD",name,json.dumps(out))
+              return out
+
+          results={}
+          with cellxgene_census.open_soma(census_version="latest") as census:
+              for name,cfg in TARGETS.items():
+                  st=source_effect(cfg["contrast"])
+                  be=brain_effect(census,cfg,st.gene_symbol.tolist())
+                  results[name]=concord(st,be,name)
+          print("=== O07_CROSS_BRAIN_GATE ===")
+          print(json.dumps(results,indent=2))
+          (OUT/"summary.json").write_text(json.dumps(results,indent=2))
+          PY
+          python /tmp/o07_crossbrain.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o07-cross-brain-gate
+          path: o07_crossbrain/
+          retention-days: 5
