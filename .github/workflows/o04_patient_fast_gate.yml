@@ -1,0 +1,249 @@
+name: O04 patient-level fast gate
+
+on:
+  push:
+    branches:
+      - o04-cdsdb-lincs-patient-concordance-20260919
+
+jobs:
+  fast_gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy scipy statsmodels
+      - name: Run locked fast patient gate
+        shell: bash
+        run: |
+          mkdir -p o04_patient_fast
+          cat > /tmp/o04_fast.py <<'PY'
+          import requests,pandas as pd,numpy as np,re,json,io,time,gzip
+          from pathlib import Path
+          from scipy.stats import spearmanr, mannwhitneyu, binomtest, wilcoxon
+          import statsmodels.formula.api as smf
+
+          OUT=Path("o04_patient_fast"); OUT.mkdir(exist_ok=True)
+          CDS="http://cdsdb.ncpsb.org.cn"
+          SIG="https://maayanlab.cloud/sigcom-lincs/metadata-api/signatures/find"
+          S=requests.Session(); S.headers.update({"User-Agent":"o04-fast-gate/0.1"})
+
+          def norm(x): return re.sub(r'[^a-z0-9]','',str(x).lower())
+          def req(method,url,**kw):
+              last=None
+              for a in range(4):
+                  try:
+                      r=S.request(method,url,timeout=180,**kw)
+                      print("HTTP",method,url,r.status_code,len(r.content))
+                      if r.status_code<500:
+                          r.raise_for_status(); return r
+                      last=RuntimeError(f"{r.status_code} {r.text[:200]}")
+                  except Exception as e:
+                      last=e; print("HTTP_ERR",repr(e))
+                  time.sleep(2*(a+1))
+              raise last
+
+          # ---------------- metadata and strict paired cohorts ----------------
+          meta=req("POST",CDS+"/cdsdb/browse/dataset",
+              headers={"Content-Type":"application/json","Accept":"application/json"},
+              json={"skip":0,"limit":500,"page":1,"filter":{},"sort":{}}).json()["data"]
+          byid={str(r.get("CDS-DB dataset ID")):r for r in meta}
+
+          raw=[]; seen=set()
+          for r in meta:
+              rid=str(r.get("CDS-DB dataset ID",""))
+              opp=str(r.get("CDS-DB dataset with the opposite response group","")).strip()
+              rg=str(r.get("Response group","")).strip().lower()
+              drugs=r.get("drugNames") or []
+              if rg not in {"response","non-response"} or not opp or opp not in byid or len(drugs)!=1: continue
+              o=byid[opp]; od=o.get("drugNames") or []; org=str(o.get("Response group","")).strip().lower()
+              if len(od)!=1 or norm(drugs[0])!=norm(od[0]) or {rg,org}!={"response","non-response"}: continue
+              key=tuple(sorted([rid,opp]))
+              if key in seen: continue
+              seen.add(key)
+              rr=r if rg=="response" else o; nn=o if rg=="response" else r
+              if norm(rr.get("Source dataset"))!=norm(nn.get("Source dataset")): continue
+              if norm(rr.get("Cancer subtype"))!=norm(nn.get("Cancer subtype")): continue
+              if norm(rr.get("Therapeutic regimen"))!=norm(nn.get("Therapeutic regimen")): continue
+              raw.append({
+                "drug":str(drugs[0]),"R_dataset":str(rr["CDS-DB dataset ID"]),"N_dataset":str(nn["CDS-DB dataset ID"]),
+                "source":str(rr.get("Source dataset","")),"cancer":str(rr.get("Cancer subtype","")),
+                "sampling_R":str(rr.get("Sampling time","")),"sampling_N":str(nn.get("Sampling time","")),
+                "n_R":int(rr.get("Patient size") or 0),"n_N":int(nn.get("Patient size") or 0)
+              })
+          print("STRICT_RAW_PAIRS",len(raw))
+
+          # Pre-locked rule before looking at any concordance:
+          # - one cohort per source x drug
+          # - select largest total sample size; deterministic tie-break by dataset IDs
+          # - require >=3 responders and >=3 nonresponders
+          chosen=[]
+          groups={}
+          for p in raw:
+              groups.setdefault((p["source"],p["drug"]),[]).append(p)
+          for key,arr in groups.items():
+              arr=sorted(arr,key=lambda x:(-(x["n_R"]+x["n_N"]),x["R_dataset"],x["N_dataset"]))
+              p=arr[0]
+              if p["n_R"]>=3 and p["n_N"]>=3: chosen.append(p)
+          chosen=sorted(chosen,key=lambda x:(x["drug"].lower(),x["source"]))
+          print("LOCKED_COHORTS_BEFORE_LINCS",len(chosen))
+          print("LOCKED_META",json.dumps(chosen,ensure_ascii=False,indent=2))
+
+          # patient IDs are directly present in each dataset metadata row
+          def patient_ids(ds):
+              row=byid[ds]
+              v=row.get("CDS patient signature list") or ""
+              if isinstance(v,list): vals=[str(x) for x in v]
+              else: vals=re.findall(r'CDS_patient_signature_\d+',str(v))
+              return list(dict.fromkeys(vals))
+
+          # ---------------- full patient profile ----------------
+          pcache={}
+          def patient_profile(pid):
+              if pid in pcache:return pcache[pid]
+              obj=req("POST",CDS+"/cdsdb/analysisResults",
+                  headers={"Content-Type":"application/json","Accept":"application/json"},
+                  json={"jobId":pid,"level":"raw/patient","logFC":1e-9,"pValue":1.0}).json()
+              tab=((obj.get("results") or {}).get("deg") or {}).get("tableData") or []
+              d=pd.DataFrame(tab)
+              if d.empty or "Gene symbol" not in d or "LogFC" not in d:
+                  pcache[pid]=None; return None
+              d["gene"]=d["Gene symbol"].astype(str).str.upper().str.strip()
+              d["coef"]=pd.to_numeric(d["LogFC"],errors="coerce")
+              d=d.dropna(subset=["gene","coef"]).copy()
+              d["abs"]=d.coef.abs()
+              # All genes, only alias de-duplication. No DEG threshold / top-k selection.
+              d=d.sort_values("abs",ascending=False).drop_duplicates("gene")[["gene","coef"]]
+              pcache[pid]=d
+              print("PATIENT_PROFILE",pid,len(d))
+              return d
+
+          # ---------------- same-drug LINCS context profiles ----------------
+          lcache={}
+          def lincs_profiles(drug):
+              if drug in lcache:return lcache[drug]
+              arr=req("POST",SIG,json={"filter":{"where":{"meta.pert_name":drug.lower()},"limit":100}}).json()
+              prof=[]
+              for x in arr:
+                  m=x.get("meta",{}); u=m.get("persistent_id")
+                  # use actual cell-context chemical profiles only; mean/rank files excluded.
+                  if str(m.get("pert_type","")).lower()!="chemical" or not m.get("cell_line") or not u: continue
+                  try:
+                      data=req("GET",u).content
+                      if data[:2]==b"\x1f\x8b" or u.endswith(".gz"): data=gzip.decompress(data)
+                      d=pd.read_csv(io.BytesIO(data),sep="\t")
+                      if "symbol" not in d.columns or "CD-coefficient" not in d.columns: continue
+                      d["gene"]=d["symbol"].astype(str).str.upper().str.strip()
+                      d["coef"]=pd.to_numeric(d["CD-coefficient"],errors="coerce")
+                      d=d.dropna(subset=["gene","coef"]).drop_duplicates("gene")[["gene","coef"]]
+                      if len(d)<1000: continue
+                      prof.append({"id":x.get("id"),"cell":m.get("cell_line"),"time":m.get("pert_time"),"dose":m.get("pert_dose"),"coef":d})
+                  except Exception as e:
+                      print("LINCS_FILE_ERR",drug,u,repr(e))
+              lcache[drug]=prof
+              print("LINCS_PROFILES",drug,len(prof))
+              return prof
+
+          def score_patient(p,profs):
+              rhos=[]; agrees=[]
+              for pr in profs:
+                  z=p.merge(pr["coef"],on="gene",suffixes=("_p","_l"))
+                  if len(z)<500: continue
+                  rho=float(spearmanr(z.coef_p,z.coef_l).statistic)
+                  if not np.isfinite(rho): continue
+                  rhos.append(rho)
+                  agrees.append(float(np.mean(np.sign(z.coef_p)==np.sign(z.coef_l))))
+              if not rhos:return None
+              return {
+                "n_lincs_profiles":len(rhos),
+                "median_rho":float(np.median(rhos)),
+                "mean_rho":float(np.mean(rhos)),
+                "max_rho":float(np.max(rhos)),
+                "q90_rho":float(np.quantile(rhos,.9)),
+                "median_direction_agreement":float(np.median(agrees))
+              }
+
+          # ---------------- evaluate ----------------
+          patient_rows=[]; cohort_rows=[]
+          for p in chosen:
+              profs=lincs_profiles(p["drug"])
+              if not profs:
+                  print("NO_LINCS",p["drug"]); continue
+              R=[]; N=[]
+              for response,ds,out in [(1,p["R_dataset"],R),(0,p["N_dataset"],N)]:
+                  ids=patient_ids(ds)
+                  print("COHORT_IDS",p["drug"],p["source"],response,ds,len(ids))
+                  for pid in ids:
+                      try:
+                          pp=patient_profile(pid)
+                          if pp is None: continue
+                          sc=score_patient(pp,profs)
+                          if sc:
+                              row={**p,"response":response,"patient_sig_id":pid,**sc}
+                              patient_rows.append(row); out.append(row)
+                      except Exception as e:
+                          print("PATIENT_ERR",pid,repr(e))
+              if R and N:
+                  rv=np.array([x["median_rho"] for x in R],float)
+                  nv=np.array([x["median_rho"] for x in N],float)
+                  mw=mannwhitneyu(rv,nv,alternative="two-sided")
+                  cohort_rows.append({
+                    **p,"scored_R":len(rv),"scored_N":len(nv),
+                    "median_rho_R":float(np.median(rv)),"median_rho_N":float(np.median(nv)),
+                    "delta_median_rho":float(np.median(rv)-np.median(nv)),
+                    "mw_p":float(mw.pvalue)
+                  })
+
+          # fixed-effect patient-level primary
+          overall={}
+          df=pd.DataFrame(patient_rows)
+          if not df.empty:
+              df["study"]=df["source"].astype(str)+"|"+df["drug"].astype(str)+"|"+df["cancer"].astype(str)
+              good=df.groupby("study").response.nunique()
+              df=df[df.study.isin(good[good==2].index)].copy()
+              overall["n_patients"]=int(len(df)); overall["n_studies"]=int(df.study.nunique())
+              overall["n_drugs"]=int(df.drug.nunique())
+              if len(df)>=10 and df.response.nunique()==2:
+                  mod=smf.ols("median_rho ~ response + C(study)",data=df).fit(cov_type="HC3")
+                  overall["beta_response"]=float(mod.params["response"])
+                  overall["CI95_response"]=[float(x) for x in mod.conf_int().loc["response"]]
+                  overall["p_response"]=float(mod.pvalues["response"])
+
+          deltas=np.array([x["delta_median_rho"] for x in cohort_rows],float)
+          if len(deltas):
+              pos=int((deltas>0).sum()); neg=int((deltas<0).sum())
+              overall.update({
+                "cohort_n":int(len(deltas)),
+                "cohort_delta_median":float(np.median(deltas)),
+                "cohort_positive":pos,"cohort_negative":neg,
+                "cohort_sign_p":float(binomtest(pos,pos+neg,.5).pvalue) if pos+neg else None
+              })
+              if len(deltas)>=2:
+                  try: overall["cohort_wilcoxon_p"]=float(wilcoxon(deltas).pvalue)
+                  except Exception as e: overall["cohort_wilcoxon_error"]=repr(e)
+
+          result={
+            "analysis_contract":{
+              "selection":"largest total sample cohort per source x drug; >=3 R and >=3 NR",
+              "patient_signature":"all available genes; alias de-dup only",
+              "LINCS_summary":"median Spearman rho across actual cell-context Chemical profiles returned by SigCom (max 100)",
+              "primary":"patient-level median_rho ~ response + study fixed effects, HC3"
+            },
+            "strict_raw_pairs":len(raw),"locked_cohorts":len(chosen),
+            "patients_scored":len(patient_rows),"complete_cohorts":len(cohort_rows),
+            "overall":overall,"cohorts":cohort_rows
+          }
+          print("=== O04_FAST_GATE_RESULT ===")
+          print(json.dumps(result,ensure_ascii=False,indent=2))
+          (OUT/"result.json").write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding="utf-8")
+          (OUT/"patients.json").write_text(json.dumps(patient_rows,ensure_ascii=False,indent=2),encoding="utf-8")
+          PY
+          python /tmp/o04_fast.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o04-patient-fast-gate
+          path: o04_patient_fast/
+          retention-days: 5
