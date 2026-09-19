@@ -1,0 +1,45 @@
+name: O05 population atlas stream schema probe
+
+on:
+  push:
+    branches:
+      - o05-ips-perturb-portability-20260919
+
+jobs:
+  probe_schema:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Probe gzip schema without full download
+        shell: bash
+        run: |
+          python - <<'PY'
+          import requests,gzip,io,json,zipfile
+          H={"User-Agent":"o05-portability/0.2"}
+          url="https://ndownloader.figshare.com/files/49291654"
+          with requests.get(url,headers=H,stream=True,timeout=180) as r:
+              print("STATUS",r.status_code,"LEN",r.headers.get("content-length"),"CTYPE",r.headers.get("content-type"))
+              r.raise_for_status()
+              r.raw.decode_content=False
+              with gzip.GzipFile(fileobj=r.raw,mode="rb") as gz:
+                  for i in range(8):
+                      line=gz.readline()
+                      print("LINE",i,line[:5000].decode("utf-8","replace").rstrip())
+          # scripts archive: inspect configs / significance thresholds / target summary logic
+          s=requests.get("https://ndownloader.figshare.com/files/58551544",headers=H,timeout=180)
+          print("SCRIPTS_STATUS",s.status_code,"BYTES",len(s.content)); s.raise_for_status()
+          z=zipfile.ZipFile(io.BytesIO(s.content))
+          names=z.namelist()
+          print("ZIP_N",len(names))
+          for n in names:
+              if any(k in n.lower() for k in ["magpie_io","7b_target_summary","6b_calc_lfcs","utils"]):
+                  print("MATCH",n)
+                  if n.lower().endswith((".r",".py",".txt",".md")):
+                      txt=z.read(n).decode("utf-8","replace")
+                      for ln in txt.splitlines():
+                          if any(k in ln for k in ["sig_pval_thresh","sig_abs_lfc_thresh","n_downstream_excl_target","pval_adj"]):
+                              print("CFG",n,ln[:1000])
+          PY
