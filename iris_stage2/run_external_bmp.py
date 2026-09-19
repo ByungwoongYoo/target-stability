@@ -79,34 +79,22 @@ R["external_cells_after_qc"]=int(ext.shape[0])
 R["external_time_counts"]={str(k):int(v) for k,v in pd.Series(times).value_counts().items()}
 
 # Map external IDs into the historical training namespace.
+# GSE114988 rows are gene symbols suffixed with "__chrN " (for example
+# "0610005C13Rik__chr7 "), whereas the historical IRIS h5ad uses gene symbols.
 train_names=pd.Index(a.var_names.astype(str)); ext_names=pd.Index(ext.columns.astype(str))
 train_ens_frac=float(np.mean(train_names.str.startswith(("ENSMUSG","ENSG"))))
 ext_ens_frac=float(np.mean(ext_names.str.startswith(("ENSMUSG","ENSG"))))
 R["train_ensembl_fraction"]=train_ens_frac; R["external_ensembl_fraction"]=ext_ens_frac
-train_base=pd.Index([x.split(".")[0] for x in train_names]); ext_base=pd.Index([x.split(".")[0] for x in ext_names])
-direct=set(train_base).intersection(set(ext_base)); R["direct_common_genes"]=len(direct)
-mapped_symbols={}
-if len(direct)<500 and ext_ens_frac>0.5:
-    import mygene
-    mg=mygene.MyGeneInfo()
-    qr=mg.querymany(list(dict.fromkeys(ext_base.tolist())),scopes="ensembl.gene",fields="symbol",species="mouse",as_dataframe=False,verbose=False)
-    for q in qr:
-        if q.get("notfound"): continue
-        if q.get("symbol"): mapped_symbols[str(q["query"])]=str(q["symbol"])
-    R["external_mapped_symbols"]=len(mapped_symbols)
-if len(direct)>=500:
-    tk={b:i for i,b in enumerate(train_base)}; ek={b:i for i,b in enumerate(ext_base)}
-    common=sorted(direct); train_idx=[tk[g] for g in common]; ext_idx=[ek[g] for g in common]
-    common_names=common; mode="direct_id"
-else:
-    tk={str(x).upper():i for i,x in enumerate(train_names)}
-    ek={}
-    for i,b in enumerate(ext_base):
-        s=mapped_symbols.get(str(b))
-        if s: ek.setdefault(s.upper(),i)
-    common=sorted(set(tk).intersection(ek))
-    train_idx=[tk[g] for g in common]; ext_idx=[ek[g] for g in common]
-    common_names=common; mode="ensembl_to_symbol"
+train_base=pd.Index([x.split(".")[0].strip() for x in train_names])
+ext_symbol=pd.Index([re.sub(r"__chr[^ ]*.*$","",str(x)).strip() for x in ext_names])
+tk={str(x).upper():i for i,x in enumerate(train_base)}
+ek={}
+for i,x in enumerate(ext_symbol):
+    if x: ek.setdefault(str(x).upper(),i)
+common=sorted(set(tk).intersection(ek))
+train_idx=[tk[g] for g in common]; ext_idx=[ek[g] for g in common]
+common_names=common; mode="symbol_chr_suffix_strip"
+R["direct_common_genes"]=len(common)
 R["mapping_mode"]=mode; R["common_gene_count"]=len(common_names); R["common_gene_head"]=common_names[:30]
 if len(common_names)<1000: raise RuntimeError("Too few common genes: "+str(len(common_names)))
 
@@ -144,23 +132,19 @@ pd.DataFrame({"cell":ext.index,"truth_bmp":y,"time":times,"linear_score":proba})
 
 # Released response-gene formula versus a sensible gene-wise signature.
 bmp=["ID2","BMPER","ID4","ID1","BAMBI","MSX1","ID3","MSX2","SMAD7"]
-if mode=="ensembl_to_symbol":
-    sym2idx={}
-    for i,b in enumerate(ext_base):
-        s=mapped_symbols.get(str(b))
-        if s: sym2idx.setdefault(s.upper(),i)
-    avail=[g for g in bmp if g in sym2idx]
-    R["bmp_signature_genes_available"]=avail
-    if len(avail)>=3:
-        raw_all=ext.to_numpy(dtype=np.float32)
-        Xsig=raw_all[:,[sym2idx[g] for g in avail]]
-        Xn=np.log1p(Xsig*(1e4/np.maximum(raw_all.sum(axis=1,keepdims=True),1)))
-        sd=Xn.std(axis=0,keepdims=True); sd[sd==0]=1
-        sensible=((Xn-Xn.mean(axis=0,keepdims=True))/sd).mean(axis=1)
-        R["sensible_signature_auroc"]=float(roc_auc_score(y,sensible)); R["sensible_signature_auprc"]=float(average_precision_score(y,sensible))
-        rsd=Xn.std(axis=1,keepdims=True); rsd[rsd==0]=1
-        released=((Xn-Xn.mean(axis=1,keepdims=True))/rsd).sum(axis=1)
-        R["released_formula_max_abs"]=float(np.max(np.abs(released))); R["released_formula_sd"]=float(np.std(released))
+sym2idx={str(x).upper():i for i,x in enumerate(ext_symbol) if str(x)}
+avail=[g for g in bmp if g in sym2idx]
+R["bmp_signature_genes_available"]=avail
+if len(avail)>=3:
+    raw_all=ext.to_numpy(dtype=np.float32)
+    Xsig=raw_all[:,[sym2idx[g] for g in avail]]
+    Xn=np.log1p(Xsig*(1e4/np.maximum(raw_all.sum(axis=1,keepdims=True),1)))
+    sd=Xn.std(axis=0,keepdims=True); sd[sd==0]=1
+    sensible=((Xn-Xn.mean(axis=0,keepdims=True))/sd).mean(axis=1)
+    R["sensible_signature_auroc"]=float(roc_auc_score(y,sensible)); R["sensible_signature_auprc"]=float(average_precision_score(y,sensible))
+    rsd=Xn.std(axis=1,keepdims=True); rsd[rsd==0]=1
+    released=((Xn-Xn.mean(axis=1,keepdims=True))/rsd).sum(axis=1)
+    R["released_formula_max_abs"]=float(np.max(np.abs(released))); R["released_formula_sd"]=float(np.std(released))
 
 # One-signal IRIS-style SCVI/SCANVI transfer smoke test. Published pretrained weights are unavailable.
 try:
