@@ -1,0 +1,167 @@
+name: O02 cross-ancestry clinical pilot
+
+on:
+  push:
+    branches:
+      - o02-cross-ancestry-proteogenomics-20260919
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas openpyxl scipy statsmodels
+      - name: Run first numerical pilot
+        shell: bash
+        run: |
+          cat > /tmp/o02_pilot.py <<'PY'
+          import io, zipfile, requests, pandas as pd, numpy as np, json
+          from scipy.stats import fisher_exact, mannwhitneyu
+          import statsmodels.api as sm
+          from statsmodels.formula.api import glm
+
+          UA={"User-Agent":"o02-cross-ancestry/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          eas_url="https://www.medrxiv.org/content/medrxiv/early/2026/02/06/2026.02.05.26345625/DC1/embed/media-1.zip?download=true"
+          r=requests.get(eas_url,headers=UA,timeout=180); r.raise_for_status()
+          z=zipfile.ZipFile(io.BytesIO(r.content))
+          xlsx=z.read("Supplementary Tables.xlsx")
+
+          # Header row is second row in the workbook.
+          st3=pd.read_excel(io.BytesIO(xlsx),sheet_name="ST3",header=1)
+          st5=pd.read_excel(io.BytesIO(xlsx),sheet_name="ST5",header=1)
+          print("ST3",st3.shape,list(st3.columns))
+          print("ST5",st5.shape,list(st5.columns))
+
+          # Harmonise key columns.
+          st3=st3.rename(columns={c:str(c).strip() for c in st3.columns})
+          st5=st5.rename(columns={c:str(c).strip() for c in st5.columns})
+          map3=st3[["Aptamer","SNP","Protein"]].drop_duplicates()
+
+          x=st5.merge(map3,on=["Aptamer","SNP"],how="left")
+          x=x[x["cis_trans"].astype(str).str.lower().eq("cis")].copy()
+          for c in ["CKB_BETA (SomaScan)","CKB_P (SomaScan)","BETA_deCODE (SomaScan)","P_deCODE (SomaScan)"]:
+              x[c]=pd.to_numeric(x[c],errors="coerce")
+          tested=x.dropna(subset=["BETA_deCODE (SomaScan)","P_deCODE (SomaScan)","Protein"]).copy()
+          tested["same_dir"]=np.sign(tested["CKB_BETA (SomaScan)"])==np.sign(tested["BETA_deCODE (SomaScan)"])
+          tested["strict_rep"]=(tested["P_deCODE (SomaScan)"]<5e-8)&tested["same_dir"]
+          tested["nominal_rep"]=(tested["P_deCODE (SomaScan)"]<0.05)&tested["same_dir"]
+          tested["abs_beta"]=tested["CKB_BETA (SomaScan)"].abs()
+          # ST5 lacks EAF; pull it from ST3 by Aptamer+SNP.
+          eaf=st3[["Aptamer","SNP","EA_FREQ"]].drop_duplicates()
+          tested=tested.merge(eaf,on=["Aptamer","SNP"],how="left")
+          tested["EA_FREQ"]=pd.to_numeric(tested["EA_FREQ"],errors="coerce")
+          tested["maf"]=np.minimum(tested["EA_FREQ"],1-tested["EA_FREQ"])
+
+          print("CIS_TESTED_ROWS",len(tested))
+          print("STRICT_ROWS",int(tested.strict_rep.sum()),"RATE",float(tested.strict_rep.mean()))
+          print("NOMINAL_ROWS",int(tested.nominal_rep.sum()),"RATE",float(tested.nominal_rep.mean()))
+          print("STRICT_SAME_DIR_R",float(tested.loc[tested["P_deCODE (SomaScan)"]<5e-8,"same_dir"].mean()) if (tested["P_deCODE (SomaScan)"]<5e-8).any() else None)
+
+          # Gene-level replication class: any strict-replicated cis signal => replicated.
+          gene=(tested.groupby("Protein",as_index=False)
+                .agg(strict_rep=("strict_rep","max"),
+                     nominal_rep=("nominal_rep","max"),
+                     n_cis_signals=("SNP","nunique"),
+                     max_abs_beta=("abs_beta","max"),
+                     median_abs_beta=("abs_beta","median"),
+                     median_maf=("maf","median"),
+                     min_p_decode=("P_deCODE (SomaScan)","min")))
+          print("GENES_TESTED",len(gene),"STRICT_GENES",int(gene.strict_rep.sum()),"NONREP_GENES",int((~gene.strict_rep).sum()))
+          print("NOMINAL_GENES",int(gene.nominal_rep.sum()))
+
+          # Public Minikel et al. Pharmaprojects target-indication data.
+          pp_url="https://raw.githubusercontent.com/ericminikel/genetic_support/main/data/pp.tsv"
+          pp=pd.read_csv(pp_url,sep="\t")
+          print("PP",pp.shape,list(pp.columns))
+          levels={"Preclinical":1,"Phase I":2,"Phase II":3,"Phase III":4,"Launched":5}
+          pp["hcatnum_calc"]=pp["hcat"].map(levels)
+          # A target can have multiple indications; take highest historical phase reached since 2000.
+          tg=(pp.groupby("gene",as_index=False)
+              .agg(max_phase=("hcatnum_calc","max"),
+                   n_indications=("ti_uid","nunique")))
+          tg["has_program"]=True
+
+          d=gene.merge(tg,left_on="Protein",right_on="gene",how="left").drop(columns=["gene"],errors="ignore")
+          d["max_phase"]=d["max_phase"].fillna(0)
+          d["n_indications"]=d["n_indications"].fillna(0)
+          d["has_program"]=d["max_phase"]>0
+          d["phase2plus"]=d["max_phase"]>=3
+          d["phase3plus"]=d["max_phase"]>=4
+          d["launched"]=d["max_phase"]>=5
+
+          # Basic counts + Fisher.
+          endpoints=["has_program","phase2plus","phase3plus","launched"]
+          out={"cis_tested_rows":len(tested),"strict_replicated_rows":int(tested.strict_rep.sum()),
+               "strict_row_rate":float(tested.strict_rep.mean()),
+               "genes_tested":len(gene),"strict_genes":int(gene.strict_rep.sum()),
+               "nonrep_genes":int((~gene.strict_rep).sum()),"endpoints":{}}
+          for ep in endpoints:
+              A=d[d.strict_rep]; B=d[~d.strict_rep]
+              ae=int(A[ep].sum()); be=int(B[ep].sum())
+              OR,p=fisher_exact([[ae,len(A)-ae],[be,len(B)-be]],alternative="two-sided")
+              out["endpoints"][ep]={
+                  "rep_n":len(A),"rep_event":ae,"rep_rate":ae/len(A) if len(A) else None,
+                  "nonrep_n":len(B),"nonrep_event":be,"nonrep_rate":be/len(B) if len(B) else None,
+                  "OR":float(OR),"p":float(p)
+              }
+
+          # Covariate balance.
+          for col in ["max_abs_beta","median_abs_beta","median_maf","n_cis_signals"]:
+              a=d.loc[d.strict_rep,col].dropna()
+              b=d.loc[~d.strict_rep,col].dropna()
+              if len(a) and len(b):
+                  U,p=mannwhitneyu(a,b,alternative="two-sided")
+                  out.setdefault("covariates",{})[col]={
+                      "rep_median":float(a.median()),"nonrep_median":float(b.median()),
+                      "p":float(p)
+                  }
+
+          # Adjusted logistic models. Use log beta because replication strongly depends on effect size.
+          d["log_abs_beta"]=np.log10(d["max_abs_beta"].clip(lower=1e-6))
+          d["maf_fill"]=d["median_maf"].fillna(d["median_maf"].median())
+          d["signals_log"]=np.log1p(d["n_cis_signals"])
+          d["rep_int"]=d.strict_rep.astype(int)
+          out["adjusted"]={}
+          for ep in endpoints:
+              d[ep+"_int"]=d[ep].astype(int)
+              try:
+                  m=glm(f"{ep}_int ~ rep_int + log_abs_beta + maf_fill + signals_log",
+                        data=d,family=sm.families.Binomial()).fit()
+                  b=float(m.params["rep_int"]); se=float(m.bse["rep_int"])
+                  out["adjusted"][ep]={
+                      "OR_replication":float(np.exp(b)),
+                      "CI95":[float(np.exp(b-1.96*se)),float(np.exp(b+1.96*se))],
+                      "p_replication":float(m.pvalues["rep_int"]),
+                      "p_effect_size":float(m.pvalues.get("log_abs_beta",np.nan)),
+                      "p_maf":float(m.pvalues.get("maf_fill",np.nan)),
+                      "p_signal_count":float(m.pvalues.get("signals_log",np.nan))
+                  }
+              except Exception as e:
+                  out["adjusted"][ep]={"error":repr(e)}
+
+          # Secondary nominal replication class.
+          out["nominal_endpoints"]={}
+          for ep in endpoints:
+              A=d[d.nominal_rep]; B=d[~d.nominal_rep]
+              ae=int(A[ep].sum()); be=int(B[ep].sum())
+              OR,p=fisher_exact([[ae,len(A)-ae],[be,len(B)-be]],alternative="two-sided")
+              out["nominal_endpoints"][ep]={
+                  "rep_n":len(A),"rep_event":ae,"rep_rate":ae/len(A) if len(A) else None,
+                  "nonrep_n":len(B),"nonrep_event":be,"nonrep_rate":be/len(B) if len(B) else None,
+                  "OR":float(OR),"p":float(p)
+              }
+
+          # Top non-replicated and replicated targets with most advanced programs, for sanity checks.
+          out["examples_replicated"]=d[d.strict_rep].sort_values(["max_phase","n_indications"],ascending=False)[
+              ["Protein","max_phase","n_indications","max_abs_beta","min_p_decode"]].head(25).to_dict("records")
+          out["examples_nonrep"]=d[~d.strict_rep].sort_values(["max_phase","n_indications"],ascending=False)[
+              ["Protein","max_phase","n_indications","max_abs_beta","min_p_decode"]].head(25).to_dict("records")
+
+          print("=== O02_CROSS_ANCESTRY_CLINICAL_PILOT ===")
+          print(json.dumps(out,indent=2,default=str))
+          PY
+          python /tmp/o02_pilot.py
