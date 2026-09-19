@@ -1,0 +1,28 @@
+name: O04 cancer mapping probe
+on:
+  push:
+    branches: [o04-proteomic-therapeutic-window-20260919]
+jobs:
+  map:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install pandas openpyxl requests
+      - shell: bash
+        run: |
+          python - <<'PY'
+          import io,requests,pandas as pd,json
+          u="https://media.springernature.com/original/springer-static/esm/art%3A10.1038%2Fs41586-026-10660-y/MediaObjects/41586_2026_10660_MOESM3_ESM.xlsx"
+          r=requests.get(u,timeout=180,headers={"User-Agent":"Mozilla/5.0"}); print(r.status_code,len(r.content)); r.raise_for_status()
+          xf=pd.ExcelFile(io.BytesIO(r.content)); print("SHEETS",xf.sheet_names)
+          for sh in xf.sheet_names:
+              d=pd.read_excel(io.BytesIO(r.content),sheet_name=sh)
+              print("SHEET",sh,"SHAPE",d.shape,"COLS",list(d.columns))
+              print(d.head(20).to_json(orient="records",default_handler=str))
+              for c in d.columns:
+                  if any(k in str(c).lower() for k in ["cancer","tissue","abbr","organ","sample"]):
+                      vals=d[c].dropna().astype(str).unique().tolist()
+                      print("UNIQUE",c,json.dumps(vals[:200]))
+          PY
