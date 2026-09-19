@@ -1,0 +1,177 @@
+name: O05 KOLF2 human dosage gate
+
+on:
+  push:
+    branches:
+      - o05-kolf2-human-dosage-validity-20260919
+
+jobs:
+  dosage_gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: pip install requests pandas numpy scipy scikit-learn openpyxl
+      - name: Run genome-wide dosage-validity pilot
+        shell: bash
+        run: |
+          mkdir -p o05_dosage
+          cat > /tmp/o05.py <<'PY'
+          import io,json,gzip,re,requests
+          import numpy as np,pandas as pd
+          from scipy.stats import spearmanr, mannwhitneyu, fisher_exact
+          from sklearn.metrics import roc_auc_score
+          from pathlib import Path
+
+          OUT=Path("o05_dosage")
+          H={"User-Agent":"o05-kolf2-human-dosage/0.1"}
+
+          FITNESS_URL="https://raw.githubusercontent.com/y-doctor/KOLF2.1J_Perturbation_Cell_Atlas/main/docs/data/mde/fitness.json"
+          XLSX_URL="https://raw.githubusercontent.com/y-doctor/KOLF2.1J_Perturbation_Cell_Atlas/main/psp/notebooks/input_files/D6-D14-Fitness-Z-Scores.xlsx"
+          DEPMAP_URL="https://raw.githubusercontent.com/y-doctor/KOLF2.1J_Perturbation_Cell_Atlas/main/psp/notebooks/input_files/DepmapVSKOLF2-2025.csv"
+          GNOMAD_URL="https://storage.googleapis.com/gnomad-public/release/2.1.1/constraint/gnomad.v2.1.1.lof_metrics.by_gene.txt.bgz"
+
+          def get(url,timeout=300):
+              r=requests.get(url,headers=H,timeout=timeout)
+              print("GET",url,r.status_code,len(r.content),r.headers.get("content-type"))
+              r.raise_for_status()
+              return r.content
+
+          # ---------- KOLF2 author-provided genome-wide D14 fitness ----------
+          fit_obj=json.loads(get(FITNESS_URL).decode())
+          genes=fit_obj["genes"]
+          fit=pd.DataFrame([{"gene":g.upper(),"fitness_z":v["z"],"rank_pos":v["rp"],"rank_neg":v["rn"]} for g,v in genes.items() if g and str(g).lower()!="nan"])
+          fit=fit.drop_duplicates("gene")
+          print("KOLF_FITNESS_N",len(fit))
+          print("FIT_Z_DESC",fit.fitness_z.describe().to_dict())
+
+          # Audit workbook semantics / orientation. Do not derive endpoint from selected subset.
+          xb=get(XLSX_URL)
+          xf=pd.ExcelFile(io.BytesIO(xb))
+          print("FITNESS_XLSX_SHEETS",xf.sheet_names)
+          audit=[]
+          for sh in xf.sheet_names:
+              d=pd.read_excel(io.BytesIO(xb),sheet_name=sh)
+              print("XLSX",sh,"SHAPE",d.shape,"COLS",json.dumps([str(c) for c in d.columns]))
+              print("XLSX_HEAD",sh,d.head(5).to_json(orient="records")[:5000])
+              audit.append({"sheet":sh,"shape":list(d.shape),"cols":[str(c) for c in d.columns]})
+
+          # ---------- gnomAD gene constraint ----------
+          gb=get(GNOMAD_URL)
+          g=pd.read_csv(io.BytesIO(gb),sep="\t",compression="gzip",low_memory=False)
+          print("GNOMAD_SHAPE",g.shape)
+          print("GNOMAD_COLS",json.dumps(g.columns.tolist()))
+          gene_col="gene" if "gene" in g.columns else "gene_name"
+          loeuf_col="oe_lof_upper" if "oe_lof_upper" in g.columns else ("lof.oe_ci.upper" if "lof.oe_ci.upper" in g.columns else None)
+          if loeuf_col is None:
+              raise RuntimeError("LOEUF column not found")
+          keep=[gene_col,loeuf_col]
+          if "pLI" in g.columns: keep.append("pLI")
+          if "oe_lof_upper_bin" in g.columns: keep.append("oe_lof_upper_bin")
+          g=g[keep].copy().rename(columns={gene_col:"gene",loeuf_col:"loeuf"})
+          g["gene"]=g.gene.astype(str).str.upper()
+          g["loeuf"]=pd.to_numeric(g.loeuf,errors="coerce")
+          if "pLI" in g: g["pLI"]=pd.to_numeric(g.pLI,errors="coerce")
+          g=g.dropna(subset=["loeuf"]).drop_duplicates("gene")
+          m=fit.merge(g,on="gene",how="inner")
+          print("MERGED_N",len(m))
+
+          # Whole-genome continuous primary. Lower LOEUF = stronger human LoF intolerance.
+          rho,p=spearmanr(m.fitness_z,m.loeuf,nan_policy="omit")
+          print("PRIMARY_RHO_FITNESSZ_LOEUF",rho,p)
+
+          # Pre-specified within-merged deciles avoid imported arbitrary thresholds.
+          q_lo=float(m.loeuf.quantile(.10)); q_hi=float(m.loeuf.quantile(.90))
+          constrained=m[m.loeuf<=q_lo]
+          tolerant=m[m.loeuf>=q_hi]
+          mw=mannwhitneyu(constrained.fitness_z,tolerant.fitness_z,alternative="two-sided")
+          print("LOEUF_DECILES",q_lo,q_hi,"N",len(constrained),len(tolerant),
+                "MEDIAN_Z",float(constrained.fitness_z.median()),float(tolerant.fitness_z.median()),
+                "MW",mw.statistic,mw.pvalue)
+
+          # Which sign of fitness z denotes depletion is determined empirically from author ranking + known DepMap list audit,
+          # but report both orientation-free discrimination metrics.
+          y=(m.loeuf<=q_lo).astype(int).to_numpy()
+          auc_z=float(roc_auc_score(y,m.fitness_z))
+          auc_negz=float(roc_auc_score(y,-m.fitness_z))
+          print("AUC_LOW_LOEUF_Z",auc_z,"AUC_LOW_LOEUF_NEGZ",auc_negz)
+
+          # Strongest depletion/growth deciles using raw z, reported symmetrically without choosing after outcome.
+          qz_lo=float(m.fitness_z.quantile(.10)); qz_hi=float(m.fitness_z.quantile(.90))
+          m["human_constrained"]=m.loeuf<=q_lo
+          m["z_bottom"]=m.fitness_z<=qz_lo
+          m["z_top"]=m.fitness_z>=qz_hi
+          def enrich(mask):
+              a=int((m.loc[mask,"human_constrained"]).sum())
+              b=int(mask.sum()-a)
+              c=int((m.loc[~mask,"human_constrained"]).sum())
+              d=int((~mask).sum()-c)
+              OR,pv=fisher_exact([[a,b],[c,d]])
+              return {"a":a,"b":b,"c":c,"d":d,"OR":float(OR),"p":float(pv)}
+          zbottom=enrich(m.z_bottom); ztop=enrich(m.z_top)
+          print("BOTTOM_Z_ENRICH",json.dumps(zbottom))
+          print("TOP_Z_ENRICH",json.dumps(ztop))
+
+          # pLI secondary endpoint if available (legacy metric; not primary).
+          pli=None
+          if "pLI" in m.columns:
+              mm=m.dropna(subset=["pLI"]).copy()
+              yy=(mm.pLI>=.9).astype(int)
+              if yy.nunique()==2:
+                  pli={"n":len(mm),"events":int(yy.sum()),
+                       "auc_z":float(roc_auc_score(yy,mm.fitness_z)),
+                       "auc_negz":float(roc_auc_score(yy,-mm.fitness_z)),
+                       "rho_z_pli":float(spearmanr(mm.fitness_z,mm.pLI).statistic)}
+                  print("PLI_SECONDARY",json.dumps(pli))
+
+          # ---------- Author-provided DepMap vs KOLF2 ranked-list audit ----------
+          db=pd.read_csv(io.BytesIO(get(DEPMAP_URL)))
+          print("DEPMAP_KOLF_FILE",db.shape,db.columns.tolist())
+          rank_audit={}
+          for col in db.columns:
+              s=db[col].dropna().astype(str).str.upper().drop_duplicates().reset_index(drop=True)
+              rg=pd.DataFrame({"gene":s,"rank":np.arange(1,len(s)+1)})
+              x=rg.merge(g,on="gene",how="inner").dropna(subset=["loeuf"])
+              rr=float(spearmanr(x["rank"],x["loeuf"]).statistic) if len(x)>2 else None
+              low_rate=float((x.loeuf<=q_lo).mean()) if len(x) else None
+              rank_audit[col]={"list_n":len(s),"merged_n":len(x),"rank_vs_loeuf_rho":rr,"low_loeuf_rate_using_kolf_threshold":low_rate}
+          print("RANK_LIST_AUDIT",json.dumps(rank_audit))
+
+          result={
+            "source_contract":{
+              "kolf_fitness":"author docs/data/mde/fitness.json; all genes, no strong-perturbation filter",
+              "gnomad":"v2.1.1 pLoF Metrics by Gene; LOEUF=oe_lof_upper",
+              "primary":"Spearman fitness_z vs LOEUF across matched genes",
+              "secondary":"within-merged LOEUF decile contrast and orientation-free AUC"
+            },
+            "kolf_n":int(len(fit)),
+            "gnomad_n":int(len(g)),
+            "merged_n":int(len(m)),
+            "primary":{"rho_fitness_z_vs_loeuf":float(rho),"p":float(p)},
+            "decile_contrast":{"loeuf_q10":q_lo,"loeuf_q90":q_hi,
+                "n_constrained":int(len(constrained)),"n_tolerant":int(len(tolerant)),
+                "median_fitness_z_constrained":float(constrained.fitness_z.median()),
+                "median_fitness_z_tolerant":float(tolerant.fitness_z.median()),
+                "mannwhitney_p":float(mw.pvalue)},
+            "auc_low_loeuf":{"fitness_z":auc_z,"negative_fitness_z":auc_negz},
+            "bottom_z_enrichment":zbottom,
+            "top_z_enrichment":ztop,
+            "pli_secondary":pli,
+            "author_rank_list_audit":rank_audit,
+            "fitness_workbook_audit":audit
+          }
+          print("=== O05_DOSAGE_GATE_RESULT ===")
+          print(json.dumps(result,indent=2))
+          (OUT/"summary.json").write_text(json.dumps(result,indent=2))
+          m[["gene","fitness_z","loeuf"]+([ "pLI"] if "pLI" in m.columns else [])].to_csv(OUT/"merged_gene_metrics.tsv",sep="\t",index=False)
+          PY
+          python /tmp/o05.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: o05-kolf2-human-dosage
+          path: o05_dosage/
+          retention-days: 5
