@@ -1,0 +1,35 @@
+name: IRIS external validation gate
+
+on:
+  push:
+    branches:
+      - iris-validation-20260919
+    paths:
+      - 'iris_external_gate/**'
+      - '.github/workflows/iris_external_gate.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install lightweight audit dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "anndata==0.10.6" pandas numpy scipy scikit-learn requests h5py
+      - name: Run bounded IRIS feasibility gate
+        run: python iris_external_gate/run_gate.py
+      - name: Upload gate results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-external-gate-results
+          path: iris_external_gate/results/
+          if-no-files-found: warn
