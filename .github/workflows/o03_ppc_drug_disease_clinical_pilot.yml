@@ -1,0 +1,288 @@
+name: O03 PPC drug-disease clinical pilot
+
+on:
+  push:
+    branches:
+      - o03-ppc-clinical-translation-20260919
+
+jobs:
+  pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          pip install playwright pandas numpy scipy statsmodels requests pyarrow
+          python -m playwright install --with-deps chromium
+      - name: Run PPC drug-disease pilot
+        shell: bash
+        run: |
+          cat > /tmp/o03_pilot.py <<'PY'
+          import asyncio,json,re,io,urllib.parse,xml.etree.ElementTree as ET,time
+          import pandas as pd,numpy as np,requests,pyarrow.parquet as pq
+          from scipy.stats import spearmanr,mannwhitneyu,fisher_exact
+          import statsmodels.api as sm
+          from statsmodels.formula.api import glm
+          from playwright.async_api import async_playwright
+
+          SUPA="https://booszbqgatqmsoxyhhrh.supabase.co/rest/v1"
+          S3="https://open-targets-public-data-releases.s3.amazonaws.com/"
+          NS={"s3":"http://s3.amazonaws.com/doc/2006-03-01/"}
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36"
+
+          async def fetch_ppc():
+              async with async_playwright() as p:
+                  b=await p.chromium.launch(headless=True)
+                  ctx=await b.new_context(user_agent=UA)
+                  pg=await ctx.new_page()
+                  auth={}
+                  async def cap(r):
+                      nonlocal auth
+                      if "supabase.co/rest/v1/" in r.url and not auth:
+                          for k,v in r.headers.items():
+                              if k.lower() in ["apikey","authorization"]: auth[k]=v
+                  pg.on("request",cap)
+                  await pg.goto("https://panpreclinical.org/cl_vs_ex_vivo",wait_until="domcontentloaded",timeout=120000)
+                  await pg.wait_for_timeout(5000)
+                  if not auth: raise RuntimeError("No public Supabase auth headers captured")
+
+                  async def get_json(ep):
+                      r=await ctx.request.get(SUPA+"/"+ep,headers=auth,timeout=180000)
+                      body=await r.body()
+                      print("GET",ep,"STATUS",r.status,"BYTES",len(body))
+                      if r.status>=300: raise RuntimeError(body[:500])
+                      return json.loads(body)
+
+                  async def post_json(ep,obj):
+                      r=await ctx.request.post(SUPA+"/"+ep,headers={**auth,"Content-Type":"application/json"},data=json.dumps(obj),timeout=300000)
+                      body=await r.body()
+                      print("POST",ep,"STATUS",r.status,"BYTES",len(body))
+                      if r.status>=300: raise RuntimeError(body[:1000])
+                      return json.loads(body)
+
+                  drugs=await get_json("drug_metadata?select=id,short_name,inn,pubchem_compound_id,fda_approval,selleck_target,selleck_pathway&limit=10000")
+                  samples=await get_json("sample_metadata?select=id,type,oncotree_code,main_type,study_id&limit=20000")
+                  body={
+                    "p_oncotree_codes":[],"p_main_types":[],"p_study_ids":[],
+                    "p_pathways":[],"p_targets":[],"p_fda_approvals":[],
+                    "p_metastasis_sites":[],"p_drug_classes":[],
+                    "p_short_names":[],"p_agg_function":"mean","p_value_column":"z_score",
+                    "p_x_groupby_column":"oncotree_code","p_hue_groupby_column":"short_name"
+                  }
+                  ex=await post_json("rpc/filter_aggregate_mean_aucs_2d",{**body,"p_types":["PDC","PDO","PDXC"]})
+                  cl=await post_json("rpc/filter_aggregate_mean_aucs_2d",{**body,"p_types":["PDCL"]})
+                  await b.close()
+                  return drugs,samples,ex,cl
+
+          drugs,samples,ex,cl=asyncio.run(fetch_ppc())
+          print("DRUGS",len(drugs),"SAMPLES",len(samples),"EX_AGG",len(ex),"CL_AGG",len(cl))
+          print("EX_HEAD",json.dumps(ex[:5],default=str))
+          print("CL_HEAD",json.dumps(cl[:5],default=str))
+
+          # Normalize aggregate output field names from RPC.
+          def aggdf(rows,label):
+              d=pd.DataFrame(rows)
+              print(label+"_COLS",list(d.columns))
+              # expected fields are x_group / hue_group / value / count or similar
+              xcol=next((c for c in ["x_group","x_value","group_value","oncotree_code"] if c in d.columns),None)
+              hcol=next((c for c in ["hue_group","hue_value","short_name"] if c in d.columns),None)
+              vcol=next((c for c in ["value","mean_value","agg_value","mean","z_score"] if c in d.columns),None)
+              ncol=next((c for c in ["count","sample_count","n","n_samples"] if c in d.columns),None)
+              if not all([xcol,hcol,vcol]):
+                  raise RuntimeError(f"Unknown aggregate schema {list(d.columns)}")
+              out=d.rename(columns={xcol:"oncotree_code",hcol:"short_name",vcol:label})
+              if ncol: out=out.rename(columns={ncol:label+"_n"})
+              else: out[label+"_n"]=np.nan
+              return out[["oncotree_code","short_name",label,label+"_n"]]
+
+          exd=aggdf(ex,"ex_z")
+          cld=aggdf(cl,"cl_z")
+          bias=exd.merge(cld,on=["oncotree_code","short_name"],how="inner")
+          bias["bias"]=bias.ex_z-bias.cl_z
+          # positive bias = authors' UI convention: more effective in ex vivo.
+          bias["min_n"]=bias[["ex_z_n","cl_z_n"]].min(axis=1)
+          print("MATCHED_PAIRS_RAW",len(bias))
+          print("BIAS_DESC",bias.bias.describe().to_dict())
+
+          dd=pd.DataFrame(drugs)
+          bias=bias.merge(dd,on="short_name",how="left")
+          print("FDA_COUNTS",bias.fda_approval.value_counts(dropna=False).to_dict())
+
+          # pre-specified sample support tiers
+          results={"raw_pairs":len(bias),"tiers":{}}
+          for min_n in [3,5,10]:
+              x=bias[(bias.ex_z_n>=min_n)&(bias.cl_z_n>=min_n)&bias.fda_approval.notna()].copy()
+              x["approved"]=x.fda_approval.eq("APPROVED")
+              # pair-level descriptive only
+              a=x[x.approved].bias; b=x[~x.approved].bias
+              rec={"pairs":len(x),"drugs":x.short_name.nunique(),"cancers":x.oncotree_code.nunique(),
+                   "approved_pairs":len(a),"other_pairs":len(b),
+                   "approved_bias_median":float(a.median()) if len(a) else None,
+                   "other_bias_median":float(b.median()) if len(b) else None}
+              if len(a) and len(b):
+                  U,pv=mannwhitneyu(a,b,alternative="two-sided")
+                  rec["pair_mw_p"]=float(pv)
+              # Drug-level mean/median bias to avoid pseudo-replication.
+              dg=(x.groupby(["short_name","fda_approval"],as_index=False)
+                    .agg(mean_bias=("bias","mean"),median_bias=("bias","median"),
+                         n_cancers=("oncotree_code","nunique"),median_min_n=("min_n","median")))
+              dg["approved"]=dg.fda_approval.eq("APPROVED")
+              aa=dg[dg.approved].mean_bias; bb=dg[~dg.approved].mean_bias
+              rec["drug_level"]={"n_drugs":len(dg),"approved_n":int(dg.approved.sum()),
+                                 "approved_mean_bias_median":float(aa.median()) if len(aa) else None,
+                                 "other_mean_bias_median":float(bb.median()) if len(bb) else None}
+              if len(aa) and len(bb):
+                  U,pv=mannwhitneyu(aa,bb,alternative="two-sided")
+                  rec["drug_level"]["mw_p"]=float(pv)
+              # ex-vivo-favored binary at drug level
+              dg["exfav"]=dg.mean_bias>0
+              ae=int(dg.loc[dg.approved,"exfav"].sum()); an=int(dg.approved.sum())
+              be=int(dg.loc[~dg.approved,"exfav"].sum()); bn=int((~dg.approved).sum())
+              if an and bn:
+                  OR,pv=fisher_exact([[ae,an-ae],[be,bn-be]],alternative="two-sided")
+                  rec["drug_level"].update({"approved_exfav":ae,"approved_total":an,
+                                            "other_exfav":be,"other_total":bn,"OR_exfav":float(OR),"fisher_p":float(pv)})
+              results["tiers"][str(min_n)]=rec
+
+          # Attempt indication-specific Open Targets 26.06 clinical precedence.
+          # Map PPC drugs to ChEMBL via OT drug_molecule names/synonyms; map OncoTree via NCIt xrefs into OT disease.
+          H={"User-Agent":"o03-ppc/0.1 (+https://github.com/ByungwoongYoo/target-stability)"}
+          def req(url,params=None):
+              last=None
+              for i in range(6):
+                  try:
+                      r=requests.get(url,params=params,headers=H,timeout=240)
+                      if r.status_code<500:
+                          r.raise_for_status();return r
+                      last=RuntimeError(r.status_code)
+                  except Exception as e:last=e
+                  time.sleep(2*(i+1))
+              raise last
+          def list_keys(prefix):
+              ks=[];tok=None
+              while True:
+                  params={"list-type":"2","prefix":prefix,"max-keys":"1000"}
+                  if tok:params["continuation-token"]=tok
+                  root=ET.fromstring(req(S3,params).content)
+                  ks += [x.find("s3:Key",NS).text for x in root.findall("s3:Contents",NS)]
+                  if root.findtext("s3:IsTruncated",default="false",namespaces=NS)!="true":break
+                  tok=root.findtext("s3:NextContinuationToken",default=None,namespaces=NS)
+              return ks
+          def read_ot(name,wanted):
+              fs=[]
+              for k in [x for x in list_keys(f"platform/26.06/output/{name}/") if x.endswith(".parquet")]:
+                  t=pq.read_table(io.BytesIO(req(S3+urllib.parse.quote(k,safe="/")).content))
+                  cols=[c for c in wanted if c in t.schema.names]
+                  fs.append(t.select(cols).to_pandas())
+              return pd.concat(fs,ignore_index=True)
+
+          def norm(s):return re.sub(r"[^a-z0-9]","",str(s).lower())
+          ot_drugs=read_ot("drug_molecule",["id","name","synonyms","tradeNames"])
+          alias={}
+          def labels(v):
+              out=[]
+              if isinstance(v,(list,tuple,np.ndarray)):
+                  for z in v:
+                      if isinstance(z,dict) and z.get("label"):out.append(str(z["label"]))
+                      elif z is not None:out.append(str(z))
+              return out
+          for _,r in ot_drugs.iterrows():
+              for lab in [str(r.get("name",""))]+labels(r.get("synonyms"))+labels(r.get("tradeNames")):
+                  n=norm(lab)
+                  if n:alias.setdefault(n,set()).add(str(r.id))
+          ppc_to_chembl={}
+          for _,r in dd.iterrows():
+              labs=[r.get("short_name"),r.get("inn")]
+              ids=set()
+              for lab in labs:
+                  if pd.notna(lab):
+                      q=alias.get(norm(lab),set())
+                      if len(q)==1:ids|=q
+              if len(ids)==1:ppc_to_chembl[str(r.short_name)]=next(iter(ids))
+          print("OT_DRUG_MAP",len(ppc_to_chembl),"OF",dd.short_name.nunique())
+
+          # OncoTree public API -> NCIt IDs
+          codes=sorted(set(str(x) for x in bias.oncotree_code.dropna().unique()))
+          code_ncit={}
+          for code in codes:
+              urls=[
+                f"https://oncotree.mskcc.org/api/tumorTypes/code/{code}",
+                f"https://oncotree.mskcc.org/api/tumorTypes/{code}"
+              ]
+              obj=None
+              for u in urls:
+                  try:
+                      rr=req(u)
+                      if "json" in rr.headers.get("content-type",""):
+                          obj=rr.json();break
+                  except:pass
+              if isinstance(obj,dict):
+                  vals=[]
+                  for k in ["nci","nciCode","nci_code","nciThesaurusCode"]:
+                      v=obj.get(k)
+                      if isinstance(v,str):vals.append(v)
+                      elif isinstance(v,list):vals += [str(t) for t in v]
+                  vals += [str(v) for k,v in obj.items() if "nci" in str(k).lower() and isinstance(v,str)]
+                  vals=[v for v in vals if re.search(r"C\d+",v)]
+                  if vals:code_ncit[code]=re.search(r"C\d+",vals[0]).group(0)
+          print("ONCOTREE_NCIT_MAP",len(code_ncit),"OF",len(codes),json.dumps(list(code_ncit.items())[:20]))
+
+          diseases=read_ot("disease",["id","name","dbXRefs"])
+          ncit_to_ot={}
+          for _,r in diseases.iterrows():
+              xs=r.get("dbXRefs")
+              if isinstance(xs,(list,tuple,np.ndarray)):
+                  for z in xs:
+                      m=re.search(r"C\d+",str(z))
+                      if m:ncit_to_ot.setdefault(m.group(0),set()).add(str(r.id))
+          code_ot={c:next(iter(ncit_to_ot[n])) for c,n in code_ncit.items() if n in ncit_to_ot and len(ncit_to_ot[n])==1}
+          print("ONCOTREE_OT_MAP",len(code_ot),"OF",len(codes))
+
+          ev=read_ot("evidence_clinical_precedence",["drugId","diseaseId","clinicalStage"])
+          stage={"UNKNOWN":0.0,"PRECLINICAL":0.1,"IND":0.5,"EARLY_PHASE_1":0.75,
+                 "PHASE_1":1.0,"PHASE_1_2":1.5,"PHASE_2":2.0,"PHASE_2_3":2.5,
+                 "PHASE_3":3.0,"PREAPPROVAL":3.5,"APPROVAL":4.0,"PHASE_4":4.0,"WITHDRAWAL":4.0}
+          ev["stage"]=ev.clinicalStage.astype(str).map(stage).fillna(0)
+          evmax=ev.groupby(["drugId","diseaseId"],as_index=False).stage.max()
+          pairs=bias.copy()
+          pairs["drugId"]=pairs.short_name.map(ppc_to_chembl)
+          pairs["diseaseId"]=pairs.oncotree_code.map(code_ot)
+          pairs=pairs.dropna(subset=["drugId","diseaseId"])
+          pairs=pairs.merge(evmax,on=["drugId","diseaseId"],how="left")
+          pairs["stage"]=pairs.stage.fillna(0)
+          print("INDICATION_MAPPED_PAIRS",len(pairs),"WITH_STAGE",(pairs.stage>0).sum())
+
+          results["indication_specific"]={}
+          for min_n in [3,5,10]:
+              x=pairs[(pairs.ex_z_n>=min_n)&(pairs.cl_z_n>=min_n)].copy()
+              x["phase2plus"]=x.stage>=2
+              x["phase3plus"]=x.stage>=3
+              x["approved_indication"]=x.stage>=4
+              # Compare bias distributions by clinical stage event.
+              rr={"pairs":len(x),"drugs":x.short_name.nunique(),"cancers":x.oncotree_code.nunique()}
+              for ep in ["phase2plus","phase3plus","approved_indication"]:
+                  a=x.loc[x[ep],"bias"];b=x.loc[~x[ep],"bias"]
+                  rec={"event_n":len(a),"nonevent_n":len(b),
+                       "event_bias_median":float(a.median()) if len(a) else None,
+                       "nonevent_bias_median":float(b.median()) if len(b) else None}
+                  if len(a) and len(b):
+                      U,pv=mannwhitneyu(a,b,alternative="two-sided");rec["mw_p"]=float(pv)
+                  # Logistic stage ~ bias + sample support
+                  try:
+                      x["log_min_n"]=np.log1p(x.min_n)
+                      m=glm(f"{ep} ~ bias + log_min_n",data=x,family=sm.families.Binomial()).fit()
+                      beta=float(m.params["bias"]);se=float(m.bse["bias"])
+                      rec["OR_per_1_z_bias"]=float(np.exp(beta))
+                      rec["CI95"]=[float(np.exp(beta-1.96*se)),float(np.exp(beta+1.96*se))]
+                      rec["p_bias"]=float(m.pvalues["bias"])
+                  except Exception as e:rec["glm_error"]=repr(e)
+                  rr[ep]=rec
+              results["indication_specific"][str(min_n)]=rr
+
+          print("=== O03_PPC_CLINICAL_PILOT ===")
+          print(json.dumps(results,indent=2,default=str))
+          PY
+          python /tmp/o03_pilot.py
