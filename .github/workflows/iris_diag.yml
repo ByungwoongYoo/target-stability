@@ -1,0 +1,20 @@
+name: IRIS id diagnostic
+on:
+  push:
+    branches: [iris-validation-20260919]
+    paths:
+      - 'iris_diag/**'
+      - '.github/workflows/iris_diag.yml'
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install anndata==0.10.6 pandas requests h5py
+      - run: python iris_diag/inspect_ids.py
